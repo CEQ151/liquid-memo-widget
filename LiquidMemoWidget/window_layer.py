@@ -12,6 +12,7 @@ WS_EX_APPWINDOW = 0x00040000
 WS_EX_NOACTIVATE = 0x08000000
 
 HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
@@ -42,8 +43,12 @@ def apply_tool_window(hwnd: int) -> None:
 
 
 def set_topmost(hwnd: int, enabled: bool = True) -> None:
-    if enabled:
-        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+    insert_after = HWND_TOPMOST if enabled else HWND_NOTOPMOST
+    user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+
+
+def detach_from_parent(hwnd: int) -> None:
+    user32.SetParent(hwnd, 0)
 
 
 def begin_system_move(hwnd: int) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -70,6 +71,7 @@ from window_layer import (
     WM_NCHITTEST,
     apply_tool_window,
     begin_system_move,
+    detach_from_parent,
     set_desktop_layer,
     set_topmost,
 )
@@ -538,6 +540,7 @@ class SettingsWindow(QDialog):
     def __init__(self, app: "LiquidMemoApp") -> None:
         super().__init__(None, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.app = app
+        self._last_startup_checked = is_startup_enabled()
         self.setWindowTitle("设置")
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedSize(660, 720)
@@ -577,7 +580,7 @@ class SettingsWindow(QDialog):
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
         close = PrimaryPushButton("完成", self.frame, FluentIcon.ACCEPT)
-        close.clicked.connect(self.hide)
+        close.clicked.connect(self._finish)
         header.addWidget(close)
         layout.addLayout(header)
 
@@ -616,7 +619,7 @@ class SettingsWindow(QDialog):
         self.layer.currentIndexChanged.connect(self._apply)
         self.position = self._combo_row("默认启动位置", "应用启动时窗口出现的位置。", {"右上角": "topRight", "右下角": "bottomRight", "左上角": "topLeft", "左下角": "bottomLeft", "上次位置": "last", "使用当前位置": "current"}, self.app.state.window.startPosition)
         self.position.currentIndexChanged.connect(self._apply)
-        self.startup = self._switch_row("开机自启动", "登录 Windows 后自动启动桌面备忘。", is_startup_enabled())
+        self.startup = self._switch_row("开机自启动", "登录 Windows 后自动启动桌面备忘。", self._last_startup_checked)
         self.startup.checkedChanged.connect(lambda _checked: self._apply())
 
         self.form.addStretch()
@@ -712,7 +715,47 @@ class SettingsWindow(QDialog):
     def _control_color(self, control: QWidget, fallback: str) -> str:
         return str(control.property("selectedColor") or fallback)
 
-    def _apply(self) -> None:
+    def sync_from_state(self) -> None:
+        settings = self.app.state.settings
+        blockers = [
+            self.opacity.blockSignals(True),
+            self.strength.blockSignals(True),
+            self.font_mode.blockSignals(True),
+            self.complete.blockSignals(True),
+            self.layer.blockSignals(True),
+            self.position.blockSignals(True),
+            self.startup.blockSignals(True),
+        ]
+        self.opacity.setValue(int(settings.glassOpacity * 100))
+        self.opacity_value.setText(f"{self.opacity.value()}%")
+        self.strength.setValue(int(settings.liquidStrength * 100))
+        self.strength_value.setText(f"{self.strength.value()}%")
+        self._set_color_control(self.window_color, settings.windowTint)
+        self._set_color_control(self.text_color, settings.todoTextColor)
+        self._set_color_control(self.urgent_color, settings.urgentTextColor)
+        self.font_mode.setCurrentIndex(max(0, self.font_mode.findData(settings.fontColorMode)))
+        self.complete.setCurrentIndex(max(0, self.complete.findData(settings.completeBehavior)))
+        self.layer.setCurrentIndex(max(0, self.layer.findData(settings.layerMode)))
+        self.position.setCurrentIndex(max(0, self.position.findData(self.app.state.window.startPosition)))
+        self._last_startup_checked = is_startup_enabled()
+        self.startup.setChecked(self._last_startup_checked)
+        for widget, blocked in zip(
+            [self.opacity, self.strength, self.font_mode, self.complete, self.layer, self.position, self.startup],
+            blockers,
+        ):
+            widget.blockSignals(blocked)
+
+    def _set_color_control(self, control: QWidget, color: str) -> None:
+        swatch = control.findChild(QFrame, "colorSwatch")
+        button = control.findChild(PushButton)
+        if swatch and button:
+            self._style_color_control(control, swatch, button, color)
+
+    def _finish(self) -> None:
+        self._apply(save_now=True)
+        self.hide()
+
+    def _apply(self, *_args, save_now: bool = False) -> None:
         settings = self.app.state.settings
         settings.glassOpacity = self.opacity.value() / 100
         settings.liquidStrength = self.strength.value() / 100
@@ -723,9 +766,18 @@ class SettingsWindow(QDialog):
         settings.completeBehavior = str(self.complete.currentData())
         settings.layerMode = str(self.layer.currentData())
         self.app.state.window.startPosition = str(self.position.currentData())
-        settings.startWithWindows = self.startup.isChecked()
-        set_startup(settings.startWithWindows)
-        self.app.save()
+        if self.app.state.window.startPosition == "current":
+            self.app.state.window.x = self.app.window.x()
+            self.app.state.window.y = self.app.window.y()
+        startup_checked = self.startup.isChecked()
+        settings.startWithWindows = startup_checked
+        if startup_checked != self._last_startup_checked:
+            set_startup(startup_checked)
+            self._last_startup_checked = startup_checked
+        if save_now:
+            self.app.save()
+        else:
+            self.app.save_later()
         self.app.window.apply_settings()
 
 
@@ -745,6 +797,9 @@ class MemoWindow(OneGPUWidget):
         self._auto_urgent_color = qcolor(app.state.settings.urgentTextColor)
         self._is_window_moving = False
         self._contrast_was_active = False
+        self._capture_source_ready = False
+        self._last_capture_reset = time.monotonic()
+        self._last_capture_sync = 0.0
         self._contrast_timer = QTimer(self)
         self._contrast_timer.setInterval(650)
         self._contrast_timer.timeout.connect(self.update_auto_contrast)
@@ -800,6 +855,53 @@ class MemoWindow(OneGPUWidget):
             self.container.raise_()
         set_window_exclude_from_capture(self, exclude=True)
 
+    def sync_capture_position(self, render: bool = False) -> None:
+        try:
+            self._update_pending_pos()
+            self._last_capture_sync = time.monotonic()
+            if render:
+                self._on_frame()
+        except Exception as exc:
+            print(f"[LiquidMemo] capture sync failed: {exc}")
+
+    def reset_capture_pipeline(self, reason: str = "manual") -> None:
+        try:
+            was_active = self._timer.isActive()
+            fps = self._fps or 60
+            self.stop()
+            if self._resource_id:
+                self._mgr.remove_resource(self._resource_id)
+        except Exception:
+            was_active = True
+            fps = 60
+
+        self._resource_id = 0
+        self._last_display_id = 0
+        self._capture_source_ready = False
+
+        try:
+            self._mgr.shutdown_display_capture()
+            if not self._mgr.initialize_display_capture():
+                print(f"[LiquidMemo] display capture reset failed: {reason}")
+                return
+            self.set_capture_source(display_index=self._display_index, tag="LiquidMemoWidget")
+            self._capture_source_ready = True
+            self.sync_capture_position(render=True)
+            for delay in (40, 120, 260):
+                QTimer.singleShot(delay, lambda: self.sync_capture_position(render=True))
+        except Exception as exc:
+            print(f"[LiquidMemo] display capture reset error: {exc}")
+        finally:
+            self._last_capture_reset = time.monotonic()
+            if was_active or self.isVisible():
+                self.start(fps=fps)
+
+    def refresh_capture_after_idle(self) -> None:
+        if time.monotonic() - self._last_capture_reset > 45:
+            self.reset_capture_pipeline("idle-before-move")
+        else:
+            self.sync_capture_position(render=True)
+
     def showEvent(self, event) -> None:
         super().showEvent(event)
         # Keep our own text/control layer out of the GPU screen capture. Otherwise
@@ -818,7 +920,9 @@ class MemoWindow(OneGPUWidget):
             self.app.state.window.x = self.x()
             self.app.state.window.y = self.y()
             if self._is_window_moving:
+                self.sync_capture_position(render=True)
                 return
+            self.sync_capture_position(render=False)
             QTimer.singleShot(0, self.protect_content_layer)
             self.app.save_later()
             QTimer.singleShot(120, self.update_auto_contrast)
@@ -866,6 +970,7 @@ class MemoWindow(OneGPUWidget):
         self._is_window_moving = True
         self._contrast_was_active = self._contrast_timer.isActive()
         self._contrast_timer.stop()
+        self.refresh_capture_after_idle()
         self.start(fps=30)
 
     def _end_window_move(self) -> None:
@@ -875,6 +980,7 @@ class MemoWindow(OneGPUWidget):
         self.app.state.window.x = self.x()
         self.app.state.window.y = self.y()
         self.app.save_later()
+        self.sync_capture_position(render=True)
         self.protect_content_layer()
         self.start(fps=60)
         if self.app.state.settings.fontColorMode != "manual":
@@ -895,9 +1001,18 @@ class MemoWindow(OneGPUWidget):
         y = screen.bottom() - self.height() - 32 if "bottom" in state.startPosition else screen.top() + 32
         self.move(x, y)
 
-    def apply_settings(self) -> None:
+    def apply_settings(self, refresh_rows: bool = False, reset_capture: bool = False) -> None:
         settings = self.app.state.settings
-        self.set_capture_source(display_index=0, tag="LiquidMemoWidget")
+        if reset_capture:
+            self.reset_capture_pipeline("settings")
+        elif not self._capture_source_ready:
+            self.set_capture_source(display_index=0, tag="LiquidMemoWidget")
+            self._capture_source_ready = True
+            self._last_capture_reset = time.monotonic()
+            self.sync_capture_position(render=True)
+        else:
+            self.sync_capture_position(render=False)
+
         self.enable_effects([
             EffectType.FLOW,
             EffectType.CHROMATIC_ABERRATION,
@@ -907,14 +1022,17 @@ class MemoWindow(OneGPUWidget):
         ])
         self.update_effects(build_effect_params(EFFECTS_PARAMS, settings.windowTint, settings.glassOpacity, settings.liquidStrength))
         self.start(fps=60)
-        self.refresh()
+        if refresh_rows:
+            self.refresh()
         self.protect_content_layer()
         hwnd = int(self.winId())
         apply_tool_window(hwnd)
         if settings.layerMode == "desktopLayer":
+            set_topmost(hwnd, False)
             if not set_desktop_layer(hwnd):
                 set_topmost(hwnd, True)
         else:
+            detach_from_parent(hwnd)
             set_topmost(hwnd, True)
         QTimer.singleShot(120, self.protect_content_layer)
         if settings.fontColorMode == "manual":
@@ -1216,6 +1334,7 @@ class LiquidMemoApp:
             self.window.raise_()
 
     def show_settings(self) -> None:
+        self.settings_window.sync_from_state()
         self._center_widget(self.settings_window)
         self.settings_window.show()
         self.settings_window.activateWindow()
