@@ -1,0 +1,3 @@
+PySide6>=6.11
+numpy
+PySide6-Fluent-Widgets==1.11.2
