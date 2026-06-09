@@ -93,6 +93,13 @@ def qcolor(hex_value: str, fallback: str = "#111820") -> QColor:
     return color if color.isValid() else QColor(fallback)
 
 
+def mixed_font(point_size: int = 10, weight: QFont.Weight = QFont.Normal) -> QFont:
+    font = QFont(LATIN_FONT, point_size, weight)
+    if hasattr(font, "setFamilies"):
+        font.setFamilies([LATIN_FONT, CJK_FONT, "Segoe UI Emoji"])
+    return font
+
+
 def qcolor_to_rgb(color: QColor) -> tuple[int, int, int]:
     return color.red(), color.green(), color.blue()
 
@@ -143,7 +150,7 @@ def tray_icon() -> QIcon:
     painter.setPen(QColor(255, 255, 255, 210))
     painter.drawPath(path)
     painter.setPen(QColor(28, 37, 45))
-    painter.setFont(QFont(CJK_FONT, 24, QFont.Bold))
+    painter.setFont(mixed_font(24, QFont.Bold))
     painter.drawText(QRect(10, 8, 44, 48), Qt.AlignCenter, "✓")
     painter.end()
     return QIcon(pixmap)
@@ -266,7 +273,7 @@ class TodoRow(QFrame):
         layout.addWidget(self.checkbox)
 
         self.text = TodoTextLabel(todo.text)
-        self.text.setFont(QFont(CJK_FONT, 12))
+        self.text.setFont(mixed_font(12))
         self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.apply_text_style(parent_window.text_color_for(todo), parent_window.text_needs_halo())
         layout.addWidget(self.text, 1)
@@ -293,7 +300,7 @@ class TodoRow(QFrame):
     def apply_text_style(self, color: QColor, protect: bool) -> None:
         alpha = 0.45 if self.todo.done else 1.0
         decoration = "text-decoration: line-through;" if self.todo.done else ""
-        self.text.setStyleSheet(f"{FONT_STACK_QSS} color: {css_rgba(color, alpha)}; {decoration}")
+        self.text.setStyleSheet(f"{FONT_STACK_QSS} font-size: 12pt; color: {css_rgba(color, alpha)}; {decoration}")
         if protect:
             halo = QGraphicsDropShadowEffect(self.text)
             halo.setBlurRadius(3.2)
@@ -403,7 +410,7 @@ class FluentSettingRow(CardWidget):
         text_layout.setSpacing(4)
 
         title_label = BodyLabel(title)
-        title_label.setFont(QFont(CJK_FONT, 11, QFont.Bold))
+        title_label.setFont(mixed_font(11, QFont.Bold))
         content_label = QLabel(content)
         content_label.setWordWrap(True)
         content_label.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,145); font-size: 12px;")
@@ -592,8 +599,8 @@ class SettingsWindow(QDialog):
         self.strength, self.strength_value = self._slider_row("液态强度", "调节边缘折射、色散和高光的存在感。", int(self.app.state.settings.liquidStrength * 100), 20, 140, "%")
         self.strength.valueChanged.connect(lambda value: self._slider_changed(self.strength_value, value, "%"))
         self.window_color = self._color_row("窗口颜色", "控制液态玻璃的低饱和背景染色。", self.app.state.settings.windowTint)
-        self.text_color = self._color_row("待办字体颜色", "手动模式下普通待办的文字颜色。", self.app.state.settings.todoTextColor)
-        self.urgent_color = self._color_row("加急字体颜色", "点击加急按钮后的待办文字颜色。", self.app.state.settings.urgentTextColor)
+        self.text_color = self._color_row("待办字体颜色", "选择后自动切到手动颜色，并立即应用到普通待办。", self.app.state.settings.todoTextColor, True)
+        self.urgent_color = self._color_row("加急字体颜色", "选择后自动切到手动颜色，并立即应用到加急待办。", self.app.state.settings.urgentTextColor, True)
         self.font_mode = self._combo_row(
             "字体颜色模式",
             "自动模式会根据桌面背景选择深色或浅色文字；增强模式会加极轻柔光保护阅读性。",
@@ -641,9 +648,10 @@ class SettingsWindow(QDialog):
         label.setText(f"{value}{suffix}")
         self._apply()
 
-    def _color_row(self, title: str, content: str, color: str) -> QWidget:
+    def _color_row(self, title: str, content: str, color: str, activates_manual_text_color: bool = False) -> QWidget:
         control = QWidget()
         control.setProperty("selectedColor", color)
+        control.setProperty("activatesManualTextColor", activates_manual_text_color)
         control.setFixedWidth(220)
         layout = QHBoxLayout(control)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -689,7 +697,17 @@ class SettingsWindow(QDialog):
 
     def _color_selected(self, control: QWidget, swatch: QFrame, button: PushButton, color: str) -> None:
         self._style_color_control(control, swatch, button, color)
+        if bool(control.property("activatesManualTextColor")):
+            self._set_font_color_mode("manual")
         self._apply()
+
+    def _set_font_color_mode(self, mode: str) -> None:
+        index = self.font_mode.findData(mode)
+        if index < 0 or self.font_mode.currentIndex() == index:
+            return
+        previous = self.font_mode.blockSignals(True)
+        self.font_mode.setCurrentIndex(index)
+        self.font_mode.blockSignals(previous)
 
     def _control_color(self, control: QWidget, fallback: str) -> str:
         return str(control.property("selectedColor") or fallback)
@@ -1032,7 +1050,7 @@ class MemoWindow(OneGPUWidget):
     def _adaptive_width(self, active: list[TodoItem], screen: QRect) -> int:
         if not active:
             return MIN_WIDTH
-        metrics = QFontMetrics(QFont(CJK_FONT, 12))
+        metrics = QFontMetrics(mixed_font(12))
         longest = max(metrics.horizontalAdvance(todo.text) for todo in active)
         chrome = OUTER_X * 2 + 12 + 18 + 30 + 28 + 24
         max_width = min(MAX_WIDTH, int(screen.width() * MAX_WIDTH_RATIO), screen.width() - 64)
@@ -1042,7 +1060,7 @@ class MemoWindow(OneGPUWidget):
         return max(90, width - (OUTER_X * 2 + 12 + 18 + 30 + 28 + 12))
 
     def _row_height_for(self, todo: TodoItem, text_width: int) -> int:
-        metrics = QFontMetrics(QFont(CJK_FONT, 12))
+        metrics = QFontMetrics(mixed_font(12))
         flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
         rect = metrics.boundingRect(QRect(0, 0, max(90, text_width), 2000), flags, todo.text)
         return max(ROW_HEIGHT, rect.height() + 18)
@@ -1115,7 +1133,7 @@ class LiquidMemoApp:
         self.qt = QApplication(sys.argv)
         self.qt.setQuitOnLastWindowClosed(False)
         setTheme(Theme.LIGHT)
-        self.qt.setFont(QFont(CJK_FONT, 10))
+        self.qt.setFont(mixed_font(10))
         self.qt.setStyleSheet(f"* {{ {FONT_STACK_QSS} }}")
         self.store = StateStore()
         self.state = self.store.load()

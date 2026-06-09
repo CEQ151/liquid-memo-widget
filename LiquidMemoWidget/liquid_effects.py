@@ -37,6 +37,7 @@ def build_effect_params(base_params: dict, tint: str, opacity: float, liquid_str
     params["color_grading"]["enable"] = False
     params["color_overlay"]["enable"] = True
     params["color_overlay"]["params"]["color"]["value"] = hex_to_rgb01(tint)
-    params["color_overlay"]["params"]["strength"]["value"] = max(0.0, min(0.22, opacity * 0.65))
+    overlay_strength = 0.0 if opacity <= 0 else 0.025 + opacity * 0.85
+    params["color_overlay"]["params"]["strength"]["value"] = max(0.0, min(0.28, overlay_strength))
 
     return params
