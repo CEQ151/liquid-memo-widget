@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, for example v0.0.1"
+        required: true
+        default: "v0.0.1"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ github.event.inputs.version }}"
+          } else {
+            $version = "${{ github.ref_name }}"
+          }
+          if (-not $version.StartsWith("v")) {
+            $version = "v$version"
+          }
+          $appVersion = $version.TrimStart("v")
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "APP_VERSION=$appVersion" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "Resolved release version: $version"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: "LiquidMemoWidget/requirements.txt"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r .\LiquidMemoWidget\requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Build portable app
+        shell: pwsh
+        run: .\Build.ps1
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .\dist\installer | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" .\installer\LiquidMemoWidget.iss
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $zipPath = ".\dist\LiquidMemoWidget-Portable-${env:RELEASE_VERSION}.zip"
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+          Compress-Archive -Path .\dist\LiquidMemoWidget\* -DestinationPath $zipPath -CompressionLevel Optimal
+
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem .\dist -Recurse -File |
+            Where-Object { $_.Name -match '\.(exe|zip)$' } |
+            Select-Object FullName, Length
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_VERSION }}
+          name: Liquid Memo Widget ${{ env.RELEASE_VERSION }}
+          body: |
+            ## Liquid Memo Widget ${{ env.RELEASE_VERSION }}
+
+            First public release.
+
+            ### Downloads
+            - `LiquidMemoWidget-Setup-${{ env.RELEASE_VERSION }}.exe`: Windows installer
+            - `LiquidMemoWidget-Portable-${{ env.RELEASE_VERSION }}.zip`: portable build
+
+            ### Notes
+            This release integrates the Liquid Glass rendering core from [ai12989757/WindowsLiquidGlass](https://github.com/ai12989757/WindowsLiquidGlass). See `THIRD_PARTY_NOTICES.md`.
+          files: |
+            dist/installer/LiquidMemoWidget-Setup-${{ env.RELEASE_VERSION }}.exe
+            dist/LiquidMemoWidget-Portable-${{ env.RELEASE_VERSION }}.zip

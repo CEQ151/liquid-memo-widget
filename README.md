@@ -25,6 +25,12 @@ pythonw .\RunLiquidMemoWidget.pyw
 
 The build output is generated under `dist\LiquidMemoWidget`.
 
+## Releases
+
+Version tags such as `v0.0.1` trigger the GitHub Actions release workflow. The workflow builds
+the PyInstaller app, creates a Windows installer with Inno Setup, packages a portable zip, and
+publishes both files to GitHub Releases.
+
 ## Acknowledgements
 
 This project integrates and adapts the liquid glass rendering core from
