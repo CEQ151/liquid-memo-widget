@@ -24,3 +24,15 @@ pythonw .\RunLiquidMemoWidget.pyw
 ```
 
 The build output is generated under `dist\LiquidMemoWidget`.
+
+## Acknowledgements
+
+This project integrates and adapts the liquid glass rendering core from
+[ai12989757/WindowsLiquidGlass](https://github.com/ai12989757/WindowsLiquidGlass).
+
+`WindowsLiquidGlass` provides the D3D screen-capture, rounded-rectangle SDF, GPU effect renderer,
+and Qt widget foundation used for the translucent Liquid Glass memo surface. The original upstream
+README identifies `WindowsLiquidGlass` as MIT licensed; third-party code and binaries retain their
+original ownership and license terms.
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
