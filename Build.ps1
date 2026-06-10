@@ -11,6 +11,7 @@ python -m PyInstaller `
   --noconsole `
   --name LiquidMemoWidget `
   --collect-all qfluentwidgets `
+  --hidden-import numpy `
   --add-data "$root\LiquidMemoWidget;LiquidMemoWidget" `
   --add-data "$root\WindowsLiquidGlass;WindowsLiquidGlass" `
   (Join-Path $root "RunLiquidMemoWidget.pyw")

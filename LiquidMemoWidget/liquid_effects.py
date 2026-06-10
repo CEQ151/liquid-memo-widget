@@ -10,6 +10,11 @@ def hex_to_rgb01(value: str) -> tuple[float, float, float]:
     return (int(text[0:2], 16) / 255, int(text[2:4], 16) / 255, int(text[4:6], 16) / 255)
 
 
+def color_overlay_strength(opacity: float) -> float:
+    overlay_strength = 0.0 if opacity <= 0 else 0.025 + opacity * 0.85
+    return max(0.0, min(0.28, overlay_strength))
+
+
 def build_effect_params(base_params: dict, tint: str, opacity: float, liquid_strength: float) -> dict:
     params = copy.deepcopy(base_params)
 
@@ -37,7 +42,6 @@ def build_effect_params(base_params: dict, tint: str, opacity: float, liquid_str
     params["color_grading"]["enable"] = False
     params["color_overlay"]["enable"] = True
     params["color_overlay"]["params"]["color"]["value"] = hex_to_rgb01(tint)
-    overlay_strength = 0.0 if opacity <= 0 else 0.025 + opacity * 0.85
-    params["color_overlay"]["params"]["strength"]["value"] = max(0.0, min(0.28, overlay_strength))
+    params["color_overlay"]["params"]["strength"]["value"] = color_overlay_strength(opacity)
 
     return params

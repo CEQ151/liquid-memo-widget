@@ -90,8 +90,6 @@ jobs:
           body: |
             ## Liquid Memo Widget ${{ env.RELEASE_VERSION }}
 
-            First public release.
-
             ### Downloads
             - `LiquidMemoWidget-Setup-${{ env.RELEASE_VERSION }}.exe`: Windows installer
             - `LiquidMemoWidget-Portable-${{ env.RELEASE_VERSION }}.zip`: portable build

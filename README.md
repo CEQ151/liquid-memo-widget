@@ -25,6 +25,27 @@ pythonw .\RunLiquidMemoWidget.pyw
 
 The build output is generated under `dist\LiquidMemoWidget`.
 
+## Package Locally
+
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then run:
+
+```powershell
+.\Package.ps1 -Version 0.0.1
+```
+
+This creates:
+
+- `dist\LiquidMemoWidget-Portable-v0.0.1.zip`
+- `dist\installer\LiquidMemoWidget-Setup-v0.0.1.exe`
+
+Useful options:
+
+```powershell
+.\Package.ps1 -Version 0.0.1 -SkipBuild
+.\Package.ps1 -Version 0.0.1 -SkipInstaller
+.\Package.ps1 -Version 0.0.1 -InnoSetupPath "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+```
+
 ## Releases
 
 Version tags such as `v0.0.1` trigger the GitHub Actions release workflow. The workflow builds

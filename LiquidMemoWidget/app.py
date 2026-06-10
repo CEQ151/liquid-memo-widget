@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 import time
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
+
 sys.dont_write_bytecode = True
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "0")
 
-from PySide6.QtCore import QEasingCurve, QPoint, QRect, QTimer, Qt, QPropertyAnimation
+from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QRect, QTimer, Qt, QPropertyAnimation
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +25,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QMenu,
     QScrollArea,
     QSizePolicy,
     QSystemTrayIcon,
@@ -38,7 +42,6 @@ from qfluentwidgets import (
     FluentIcon,
     PrimaryPushButton,
     PushButton,
-    RoundMenu,
     Slider,
     SmoothScrollArea,
     SubtitleLabel,
@@ -59,7 +62,7 @@ from WindowsLiquidGlass.src.GPUSharderWidget.one_d3d_widget import (  # noqa: E4
     set_window_exclude_from_capture,
 )
 
-from liquid_effects import build_effect_params
+from liquid_effects import build_effect_params, color_overlay_strength
 from startup import is_startup_enabled, set_startup
 from state_store import AppState, Settings, StateStore, TodoItem, utc_now
 from window_layer import (
@@ -72,7 +75,6 @@ from window_layer import (
     apply_tool_window,
     begin_system_move,
     detach_from_parent,
-    set_desktop_layer,
     set_topmost,
 )
 
@@ -88,6 +90,22 @@ MIN_HEIGHT = 320
 MAX_HEIGHT_RATIO = 0.7
 ROW_HEIGHT = 44
 OUTER_X = 26
+BUSY_BACKGROUND_ENTER = 0.36
+BUSY_BACKGROUND_EXIT = 0.26
+HIGH_VISIBILITY_COLORS = ["#39FF14", "#C800FF", "#00F5FF", "#FFF200"]
+_SAMPLE_DIM = 44
+# The glass output is a static transform of the captured background, so the frame loop only
+# exists to follow background changes — it does not need 60fps. Lower rates also leave room
+# for the per-frame blank-frame validation readback.
+REST_FPS = 20
+MOVE_FPS = 30
+
+
+def _dwm_flush() -> None:
+    try:
+        ctypes.windll.dwmapi.DwmFlush()
+    except Exception:
+        pass
 
 
 def qcolor(hex_value: str, fallback: str = "#111820") -> QColor:
@@ -131,6 +149,16 @@ def contrast_ratio(foreground: QColor, background: QColor) -> float:
 def best_contrast_color(background: QColor, candidates: list[str]) -> QColor:
     colors = [qcolor(candidate) for candidate in candidates]
     return max(colors, key=lambda color: contrast_ratio(color, background))
+
+
+def blend_colors(base: QColor, overlay: QColor, amount: float) -> QColor:
+    amount = max(0.0, min(1.0, amount))
+    inverse = 1.0 - amount
+    return QColor(
+        round(base.red() * inverse + overlay.red() * amount),
+        round(base.green() * inverse + overlay.green() * amount),
+        round(base.blue() * inverse + overlay.blue() * amount),
+    )
 
 
 def add_soft_shadow(widget: QWidget, blur: int = 28, y: int = 10, alpha: int = 72) -> None:
@@ -235,6 +263,8 @@ class TodoRow(QFrame):
         super().__init__(parent_window.content)
         self.todo = todo
         self.parent_window = parent_window
+        self._style_signature: tuple[str, bool, bool] | None = None
+        self._halo: QGraphicsDropShadowEffect | None = None
         self.setMinimumHeight(ROW_HEIGHT)
         self.setObjectName("todoRow")
         self.setStyleSheet(
@@ -300,19 +330,31 @@ class TodoRow(QFrame):
         layout.addWidget(self.urgent)
 
     def apply_text_style(self, color: QColor, protect: bool) -> None:
+        # Re-applying an identical style (and especially swapping in a brand-new
+        # QGraphicsDropShadowEffect) forces a repaint of the row; with the contrast timer
+        # firing every few hundred ms that reads as text flicker. Skip no-op updates and
+        # reuse the existing halo effect.
+        signature = (color.name(), self.todo.done, protect)
+        if signature == self._style_signature:
+            return
+        self._style_signature = signature
         alpha = 0.45 if self.todo.done else 1.0
         decoration = "text-decoration: line-through;" if self.todo.done else ""
         self.text.setStyleSheet(f"{FONT_STACK_QSS} font-size: 12pt; color: {css_rgba(color, alpha)}; {decoration}")
         if protect:
-            halo = QGraphicsDropShadowEffect(self.text)
-            halo.setBlurRadius(3.2)
-            halo.setOffset(0, 0)
+            halo = self._halo
+            if halo is None:
+                halo = QGraphicsDropShadowEffect(self.text)
+                halo.setBlurRadius(3.2)
+                halo.setOffset(0, 0)
+                self._halo = halo
+                self.text.setGraphicsEffect(halo)
             if relative_luminance(color) > 0.55:
                 halo.setColor(QColor(0, 0, 0, 118))
             else:
                 halo.setColor(QColor(255, 255, 255, 138))
-            self.text.setGraphicsEffect(halo)
-        else:
+        elif self._halo is not None:
+            self._halo = None
             self.text.setGraphicsEffect(None)
 
     def apply_text_width(self, text_width: int) -> int:
@@ -331,10 +373,14 @@ class TodoRow(QFrame):
 
 class AddTodoPopup(QDialog):
     def __init__(self, parent_window: "MemoWindow") -> None:
+        # Qt.Tool (not Qt.Popup): a Popup window grabs input and does not reliably hand
+        # keyboard focus to the QLineEdit on Windows, so the user could not type. The
+        # WindowDeactivate handler below gives the same click-outside-to-dismiss behavior.
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.parent_window = parent_window
         self.setWindowTitle("添加事项")
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setFixedSize(420, 74)
 
         self.panel = QFrame(self)
@@ -383,6 +429,11 @@ class AddTodoPopup(QDialog):
         self.raise_()
         self.activateWindow()
         QTimer.singleShot(0, lambda: self.input.setFocus(Qt.PopupFocusReason))
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.WindowDeactivate:
+            self.hide()
+        return super().event(event)
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key_Escape:
@@ -554,17 +605,18 @@ class SettingsWindow(QDialog):
             f"""
             QFrame#fluentPanel {{
                 {FONT_STACK_QSS}
-                background: rgb(246, 248, 252);
-                border: 1px solid rgba(255,255,255,185);
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgb(252, 253, 255), stop:1 rgb(240, 244, 250));
+                border: 1px solid rgba(255,255,255,210);
                 border-radius: 22px;
             }}
             QFrame#colorSwatch {{
                 border: 1px solid rgba(17,24,32,38);
-                border-radius: 8px;
+                border-radius: 9px;
             }}
             """
         )
-        add_soft_shadow(self.frame, blur=36, y=12, alpha=82)
+        add_soft_shadow(self.frame, blur=40, y=14, alpha=90)
 
         layout = QVBoxLayout(self.frame)
         layout.setContentsMargins(30, 26, 30, 28)
@@ -579,20 +631,36 @@ class SettingsWindow(QDialog):
         titles.addWidget(title)
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
+        reset = PushButton("恢复默认", self.frame, FluentIcon.RETURN)
+        reset.clicked.connect(self.reset_defaults)
+        header.addWidget(reset)
         close = PrimaryPushButton("完成", self.frame, FluentIcon.ACCEPT)
         close.clicked.connect(self._finish)
         header.addWidget(close)
         layout.addLayout(header)
 
+        divider = QFrame(self.frame)
+        divider.setFixedHeight(1)
+        divider.setStyleSheet("background: rgba(17,24,32,24); border: none;")
+        layout.addWidget(divider)
+
         self.scroll = SmoothScrollArea(self.frame)
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
-        self.scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self.scroll.setStyleSheet(
+            """
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical { width: 6px; background: transparent; margin: 2px; }
+            QScrollBar::handle:vertical { background: rgba(17,24,32,60); border-radius: 3px; min-height: 32px; }
+            QScrollBar::handle:vertical:hover { background: rgba(17,24,32,100); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            """
+        )
         self.content = QWidget()
         self.content.setStyleSheet("background: transparent;")
         self.form = QVBoxLayout(self.content)
-        self.form.setContentsMargins(0, 0, 0, 0)
-        self.form.setSpacing(12)
+        self.form.setContentsMargins(0, 0, 8, 0)
+        self.form.setSpacing(10)
         self.scroll.setWidget(self.content)
         layout.addWidget(self.scroll, 1)
 
@@ -615,8 +683,6 @@ class SettingsWindow(QDialog):
         self._section("行为")
         self.complete = self._combo_row("勾选完成之后", "选择完成事项是直接归档，还是留在列表中淡化显示。", {"自动归档消失": "archive", "加分割线并淡化": "dim"}, self.app.state.settings.completeBehavior)
         self.complete.currentIndexChanged.connect(self._apply)
-        self.layer = self._combo_row("窗口层级", "选择小组件贴近桌面，或始终悬浮但不阻挡鼠标。", {"始终可见且不挡鼠标": "alwaysVisibleClickThrough", "桌面同层": "desktopLayer"}, self.app.state.settings.layerMode)
-        self.layer.currentIndexChanged.connect(self._apply)
         self.position = self._combo_row("默认启动位置", "应用启动时窗口出现的位置。", {"右上角": "topRight", "右下角": "bottomRight", "左上角": "topLeft", "左下角": "bottomLeft", "上次位置": "last", "使用当前位置": "current"}, self.app.state.window.startPosition)
         self.position.currentIndexChanged.connect(self._apply)
         self.startup = self._switch_row("开机自启动", "登录 Windows 后自动启动桌面备忘。", self._last_startup_checked)
@@ -626,7 +692,12 @@ class SettingsWindow(QDialog):
 
     def _section(self, title: str) -> None:
         label = SubtitleLabel(title)
-        label.setContentsMargins(2, 8, 0, 0)
+        label.setContentsMargins(0, 10, 0, 2)
+        # A thin accent bar to the left of each section header for a cleaner Fluent rhythm.
+        label.setStyleSheet(
+            f"{FONT_STACK_QSS} color: rgb(15, 24, 32);"
+            " padding-left: 12px; border-left: 3px solid #0067C0;"
+        )
         self.form.addWidget(label)
 
     def _slider_row(self, title: str, content: str, value: int, minimum: int, maximum: int, suffix: str) -> tuple[Slider, BodyLabel]:
@@ -695,14 +766,14 @@ class SettingsWindow(QDialog):
     def _pick_color(self, control: QWidget, swatch: QFrame, button: PushButton, title: str) -> None:
         current = str(control.property("selectedColor") or "#F8FBFF")
         dialog = ColorDialog(QColor(current), title, self)
-        dialog.colorChanged.connect(lambda color: self._color_selected(control, swatch, button, color.name()))
-        dialog.exec()
+        if dialog.exec() == QDialog.Accepted:
+            self._color_selected(control, swatch, button, dialog.color.name(), save_now=True)
 
-    def _color_selected(self, control: QWidget, swatch: QFrame, button: PushButton, color: str) -> None:
+    def _color_selected(self, control: QWidget, swatch: QFrame, button: PushButton, color: str, save_now: bool = False) -> None:
         self._style_color_control(control, swatch, button, color)
         if bool(control.property("activatesManualTextColor")):
             self._set_font_color_mode("manual")
-        self._apply()
+        self._apply(save_now=save_now)
 
     def _set_font_color_mode(self, mode: str) -> None:
         index = self.font_mode.findData(mode)
@@ -722,7 +793,6 @@ class SettingsWindow(QDialog):
             self.strength.blockSignals(True),
             self.font_mode.blockSignals(True),
             self.complete.blockSignals(True),
-            self.layer.blockSignals(True),
             self.position.blockSignals(True),
             self.startup.blockSignals(True),
         ]
@@ -735,12 +805,11 @@ class SettingsWindow(QDialog):
         self._set_color_control(self.urgent_color, settings.urgentTextColor)
         self.font_mode.setCurrentIndex(max(0, self.font_mode.findData(settings.fontColorMode)))
         self.complete.setCurrentIndex(max(0, self.complete.findData(settings.completeBehavior)))
-        self.layer.setCurrentIndex(max(0, self.layer.findData(settings.layerMode)))
         self.position.setCurrentIndex(max(0, self.position.findData(self.app.state.window.startPosition)))
         self._last_startup_checked = is_startup_enabled()
         self.startup.setChecked(self._last_startup_checked)
         for widget, blocked in zip(
-            [self.opacity, self.strength, self.font_mode, self.complete, self.layer, self.position, self.startup],
+            [self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup],
             blockers,
         ):
             widget.blockSignals(blocked)
@@ -755,6 +824,14 @@ class SettingsWindow(QDialog):
         self._apply(save_now=True)
         self.hide()
 
+    def reset_defaults(self) -> None:
+        self.app.state.settings = Settings()
+        set_startup(False)
+        self._last_startup_checked = False
+        self.sync_from_state()
+        self._apply(save_now=True)
+        self.app.window.reset_capture_pipeline("reset-defaults")
+
     def _apply(self, *_args, save_now: bool = False) -> None:
         settings = self.app.state.settings
         settings.glassOpacity = self.opacity.value() / 100
@@ -764,7 +841,7 @@ class SettingsWindow(QDialog):
         settings.urgentTextColor = self._control_color(self.urgent_color, settings.urgentTextColor)
         settings.fontColorMode = str(self.font_mode.currentData())
         settings.completeBehavior = str(self.complete.currentData())
-        settings.layerMode = str(self.layer.currentData())
+        settings.layerMode = "alwaysVisibleClickThrough"
         self.app.state.window.startPosition = str(self.position.currentData())
         if self.app.state.window.startPosition == "current":
             self.app.state.window.x = self.app.window.x()
@@ -793,17 +870,34 @@ class MemoWindow(OneGPUWidget):
         self._shown_once = False
         self._sampled_background = QColor(246, 248, 252)
         self._background_complexity = 0.0
+        self._background_extremely_busy = False
         self._auto_text_color = qcolor(app.state.settings.todoTextColor)
-        self._auto_urgent_color = qcolor(app.state.settings.urgentTextColor)
+        self._last_text_color_change = 0.0
+        self._latest_frame: np.ndarray | None = None
+        self._effects_enabled = False
+        self._window_layer_applied = False
         self._is_window_moving = False
         self._contrast_was_active = False
         self._capture_source_ready = False
         self._last_capture_reset = time.monotonic()
         self._last_capture_sync = 0.0
+        self._effect_signature: tuple[str, int, int] | None = None
         self._contrast_timer = QTimer(self)
-        self._contrast_timer.setInterval(650)
+        self._contrast_timer.setTimerType(Qt.PreciseTimer)
+        self._contrast_timer.setInterval(300)
         self._contrast_timer.timeout.connect(self.update_auto_contrast)
+        # Coalesces the "force a contrast refresh after a change settled" requests so a
+        # rapid stream of apply_settings() calls (e.g. dragging a slider) collapses into a
+        # single forced sample instead of queuing dozens of full captures.
+        self._contrast_refresh_timer = QTimer(self)
+        self._contrast_refresh_timer.setSingleShot(True)
+        self._contrast_refresh_timer.timeout.connect(lambda: self.update_auto_contrast(force=True))
         self._build_content()
+
+    def schedule_contrast_refresh(self, delay: int = 180) -> None:
+        if self.app.state.settings.fontColorMode == "manual":
+            return
+        self._contrast_refresh_timer.start(delay)
 
     @property
     def content(self) -> QWidget:
@@ -867,13 +961,13 @@ class MemoWindow(OneGPUWidget):
     def reset_capture_pipeline(self, reason: str = "manual") -> None:
         try:
             was_active = self._timer.isActive()
-            fps = self._fps or 60
+            fps = self._fps or REST_FPS
             self.stop()
             if self._resource_id:
                 self._mgr.remove_resource(self._resource_id)
         except Exception:
             was_active = True
-            fps = 60
+            fps = REST_FPS
 
         self._resource_id = 0
         self._last_display_id = 0
@@ -902,6 +996,77 @@ class MemoWindow(OneGPUWidget):
         else:
             self.sync_capture_position(render=True)
 
+    def ensure_frame_loop(self, fps: int = REST_FPS) -> None:
+        if not self._timer.isActive() or self._fps != fps:
+            self.start(fps=fps)
+
+    def _on_frame(self) -> None:
+        # Validated replacement for OneGPUWidget._on_frame. The OS desktop duplication
+        # occasionally hands back an all-black frame for this WDA_EXCLUDEFROMCAPTURE
+        # window's region; the stock loop presented those directly, which is the visible
+        # black<->transparent flicker. Here every captured frame is read back and checked
+        # first — a blank frame is dropped and the last good output stays on screen.
+        d3d = self._d3d
+        if not d3d._presenter_id or d3d._capture_w <= 0 or d3d._capture_h <= 0:
+            return
+
+        new_id = self._mgr.capture_display_region(
+            display_index=self._display_index,
+            x=self._pending_x,
+            y=self._pending_y,
+            width=d3d._capture_w,
+            height=d3d._capture_h,
+            tag=self._capture_tag,
+        )
+        self._frame_count += 1
+        if not new_id:
+            self._present_last_frame()
+            return
+
+        frame: np.ndarray | None
+        try:
+            frame = self._mgr.copy_resource_to_numpy(new_id)
+        except Exception:
+            frame = None
+        if frame is not None and self._last_display_id and self._frame_looks_blank(frame):
+            if new_id != self._resource_id:
+                self._mgr.remove_resource(new_id)
+            self._present_last_frame()
+            return
+        if frame is not None:
+            self._latest_frame = frame
+
+        if self._resource_id and self._resource_id != new_id:
+            self._mgr.remove_resource(self._resource_id)
+        self._resource_id = new_id
+
+        display_id = new_id
+        if self._fx_ready and self._has_effects and self._sdf_id:
+            output_id = self._fx.render_effects_by_id(
+                screen_resource_id=new_id,
+                sdf_resource_id=self._sdf_id,
+            )
+            if output_id:
+                display_id = output_id
+            else:
+                self._present_last_frame()
+                return
+
+        _dwm_flush()
+        d3d._present(display_id)
+        self._last_display_id = display_id
+
+    def _present_last_frame(self) -> None:
+        if self._last_display_id:
+            _dwm_flush()
+            self._d3d._present(self._last_display_id)
+
+    @staticmethod
+    def _frame_looks_blank(frame: np.ndarray) -> bool:
+        # Genuine desktops are never pitch black across the whole region (even dark
+        # wallpapers carry a few brighter pixels); a duplication glitch frame is exactly 0.
+        return int(frame[::8, ::8, :3].max()) < 6
+
     def showEvent(self, event) -> None:
         super().showEvent(event)
         # Keep our own text/control layer out of the GPU screen capture. Otherwise
@@ -911,7 +1076,9 @@ class MemoWindow(OneGPUWidget):
             QTimer.singleShot(delay, self.protect_content_layer)
         if not self._shown_once:
             self._shown_once = True
-            QTimer.singleShot(0, self.apply_initial_geometry)
+            self.apply_initial_geometry()
+            QTimer.singleShot(80, self.refresh)
+            QTimer.singleShot(180, self.apply_text_colors)
         QTimer.singleShot(0, self.apply_settings)
 
     def moveEvent(self, event) -> None:
@@ -925,7 +1092,7 @@ class MemoWindow(OneGPUWidget):
             self.sync_capture_position(render=False)
             QTimer.singleShot(0, self.protect_content_layer)
             self.app.save_later()
-            QTimer.singleShot(120, self.update_auto_contrast)
+            self.schedule_contrast_refresh(80)
 
     def nativeEvent(self, event_type, message):
         if event_type == b"windows_generic_MSG":
@@ -941,7 +1108,7 @@ class MemoWindow(OneGPUWidget):
                     return True, HTCAPTION
                 if self._is_interactive_point(local):
                     return True, HTCLIENT
-                if self.app.state.settings.layerMode in ("alwaysVisibleClickThrough", "desktopLayer"):
+                if self.app.state.settings.layerMode == "alwaysVisibleClickThrough":
                     return True, HTTRANSPARENT
             if msg.message == WM_ENTERSIZEMOVE:
                 self._begin_window_move()
@@ -971,7 +1138,7 @@ class MemoWindow(OneGPUWidget):
         self._contrast_was_active = self._contrast_timer.isActive()
         self._contrast_timer.stop()
         self.refresh_capture_after_idle()
-        self.start(fps=30)
+        self.start(fps=MOVE_FPS)
 
     def _end_window_move(self) -> None:
         if not self._is_window_moving:
@@ -982,10 +1149,10 @@ class MemoWindow(OneGPUWidget):
         self.app.save_later()
         self.sync_capture_position(render=True)
         self.protect_content_layer()
-        self.start(fps=60)
+        self.start(fps=REST_FPS)
         if self.app.state.settings.fontColorMode != "manual":
             self._contrast_timer.start()
-            QTimer.singleShot(220, self.update_auto_contrast)
+            self.schedule_contrast_refresh()
 
     def apply_initial_geometry(self) -> None:
         self.refresh()
@@ -1013,35 +1180,44 @@ class MemoWindow(OneGPUWidget):
         else:
             self.sync_capture_position(render=False)
 
-        self.enable_effects([
-            EffectType.FLOW,
-            EffectType.CHROMATIC_ABERRATION,
-            EffectType.HIGHLIGHT,
-            EffectType.ANTI_ALIASING,
-            EffectType.COLOR_OVERLAY,
-        ])
-        self.update_effects(build_effect_params(EFFECTS_PARAMS, settings.windowTint, settings.glassOpacity, settings.liquidStrength))
-        self.start(fps=60)
+        # Re-enabling the effect chain resets renderer state and can drop/blank a frame, so
+        # do it once: apply_settings runs on every slider tick while dragging.
+        if not self._effects_enabled:
+            self.enable_effects([
+                EffectType.FLOW,
+                EffectType.CHROMATIC_ABERRATION,
+                EffectType.HIGHLIGHT,
+                EffectType.ANTI_ALIASING,
+                EffectType.COLOR_OVERLAY,
+            ])
+            self._effects_enabled = True
+        effect_signature = (settings.windowTint, int(settings.glassOpacity * 1000), int(settings.liquidStrength * 1000))
+        if effect_signature != self._effect_signature:
+            self.update_effects(build_effect_params(EFFECTS_PARAMS, settings.windowTint, settings.glassOpacity, settings.liquidStrength))
+            self._effect_signature = effect_signature
+        self.ensure_frame_loop(fps=REST_FPS)
         if refresh_rows:
             self.refresh()
         self.protect_content_layer()
-        hwnd = int(self.winId())
-        apply_tool_window(hwnd)
-        if settings.layerMode == "desktopLayer":
-            set_topmost(hwnd, False)
-            if not set_desktop_layer(hwnd):
-                set_topmost(hwnd, True)
-        else:
-            detach_from_parent(hwnd)
-            set_topmost(hwnd, True)
-        QTimer.singleShot(120, self.protect_content_layer)
+        self.apply_window_layer()
         if settings.fontColorMode == "manual":
             self._contrast_timer.stop()
             self.apply_text_colors()
         else:
             if not self._contrast_timer.isActive():
                 self._contrast_timer.start()
-            QTimer.singleShot(220, self.update_auto_contrast)
+            self.schedule_contrast_refresh()
+
+    def apply_window_layer(self) -> None:
+        # SetWindowPos/Z-order churn on every apply_settings call makes the window flash;
+        # the tool-window style, parent detach, and topmost flag are sticky, so once is enough.
+        if not self.isVisible() or self._window_layer_applied:
+            return
+        hwnd = int(self.winId())
+        apply_tool_window(hwnd)
+        detach_from_parent(hwnd)
+        set_topmost(hwnd, True)
+        self._window_layer_applied = True
 
     def refresh(self) -> None:
         while self.list_layout.count():
@@ -1064,12 +1240,17 @@ class MemoWindow(OneGPUWidget):
 
     def text_color_for(self, todo: TodoItem) -> QColor:
         settings = self.app.state.settings
+        if todo.urgent:
+            return qcolor(settings.urgentTextColor, "#FF0000")
         if settings.fontColorMode == "manual":
-            return qcolor(settings.urgentTextColor if todo.urgent else settings.todoTextColor)
-        return QColor(self._auto_urgent_color if todo.urgent else self._auto_text_color)
+            return qcolor(settings.todoTextColor)
+        return QColor(self._auto_text_color)
 
     def text_needs_halo(self) -> bool:
-        return self.app.state.settings.fontColorMode == "autoEnhanced"
+        settings = self.app.state.settings
+        if settings.fontColorMode == "manual":
+            return False
+        return settings.fontColorMode == "autoEnhanced" or self._background_extremely_busy
 
     def apply_text_colors(self) -> None:
         for row in self._rows.values():
@@ -1080,68 +1261,118 @@ class MemoWindow(OneGPUWidget):
             empty_color = QColor(self._auto_text_color)
         self.empty.setStyleSheet(f"{FONT_STACK_QSS} color: {css_rgba(empty_color, 0.58)}; font-size: 15px;")
 
-    def update_auto_contrast(self) -> None:
+    def update_auto_contrast(self, force: bool = False) -> None:
         if not self.isVisible() or self.app.state.settings.fontColorMode == "manual":
             return
         sample = self._sample_background()
         if sample is None:
-            return
+            sampled_background = QColor(self._sampled_background)
+            complexity = self._background_complexity
+        else:
+            sampled_background, complexity = sample
 
-        background, complexity = sample
-        next_text = best_contrast_color(background, ["#05080C", "#111820", "#F7FAFF", "#FFFFFF"])
-        next_urgent = best_contrast_color(background, ["#B3261E", "#D13438", "#F04438", "#FFB4AB", "#FFDAD6"])
+        background = self._effective_contrast_background(sampled_background)
+        busy = complexity >= (BUSY_BACKGROUND_EXIT if self._background_extremely_busy else BUSY_BACKGROUND_ENTER)
+        if busy:
+            next_text = best_contrast_color(background, HIGH_VISIBILITY_COLORS)
+        else:
+            next_text = best_contrast_color(background, ["#05080C", "#111820", "#F7FAFF", "#FFFFFF"])
 
         current_text_gain = contrast_ratio(self._auto_text_color, background)
         next_text_gain = contrast_ratio(next_text, background)
-        current_urgent_gain = contrast_ratio(self._auto_urgent_color, background)
-        next_urgent_gain = contrast_ratio(next_urgent, background)
 
+        now = time.monotonic()
         changed = False
-        if next_text.name() != self._auto_text_color.name() and next_text_gain > current_text_gain + 0.45:
+        if busy != self._background_extremely_busy:
+            self._background_extremely_busy = busy
+            changed = True
+        # Switch color only when the current one is genuinely hard to read, or the candidate
+        # is clearly better AND the last switch has settled. Rapid back-and-forth color swaps
+        # every sample read as text flicker, so prefer keeping a readable color stable.
+        settled = (now - self._last_text_color_change) >= 1.0
+        should_switch = force or current_text_gain < 3.2 or (settled and next_text_gain > current_text_gain + 0.75)
+        if next_text.name() != self._auto_text_color.name() and should_switch:
             self._auto_text_color = next_text
+            self._last_text_color_change = now
             changed = True
-        if next_urgent.name() != self._auto_urgent_color.name() and next_urgent_gain > current_urgent_gain + 0.35:
-            self._auto_urgent_color = next_urgent
-            changed = True
-        if abs(complexity - self._background_complexity) > 0.05:
-            self._background_complexity = complexity
-            changed = True
-        self._sampled_background = background
+        self._background_complexity = complexity
+        self._sampled_background = sampled_background
 
         if changed:
             self.apply_text_colors()
 
+    def _effective_contrast_background(self, sampled_background: QColor) -> QColor:
+        settings = self.app.state.settings
+        tint = qcolor(settings.windowTint, "#FFFFFF")
+        return blend_colors(sampled_background, tint, color_overlay_strength(settings.glassOpacity))
+
     def _sample_background(self) -> tuple[QColor, float] | None:
-        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
-        if not screen:
+        # Reuse the frame the validated render loop (_on_frame) already read back and
+        # blank-checked: the desktop content directly behind this window with the window
+        # itself omitted. The contrast sampler therefore issues no screen capture and no
+        # GPU readback of its own.
+        frame = self._latest_frame
+        if frame is None:
             return None
-        try:
-            pixmap = screen.grabWindow(0, self.x(), self.y(), max(24, self.width()), max(24, self.height()))
-        except Exception:
-            return None
-        if pixmap.isNull():
-            return None
-        image = pixmap.scaled(28, 28, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).toImage()
-        if image.isNull():
-            return None
+        return self._analyze_sample_array(frame)
 
-        total_r = total_g = total_b = 0
-        luminances: list[float] = []
-        count = image.width() * image.height()
-        for y in range(image.height()):
-            for x in range(image.width()):
-                color = image.pixelColor(x, y)
-                total_r += color.red()
-                total_g += color.green()
-                total_b += color.blue()
-                luminances.append(relative_luminance(color))
-        if count <= 0:
+    def _analyze_sample_array(self, bgra: np.ndarray) -> tuple[QColor, float] | None:
+        if bgra is None or bgra.ndim != 3 or bgra.shape[0] < 2 or bgra.shape[1] < 2:
             return None
+        step_y = max(1, bgra.shape[0] // _SAMPLE_DIM)
+        step_x = max(1, bgra.shape[1] // _SAMPLE_DIM)
+        sample = bgra[::step_y, ::step_x, :3].astype(np.float32) / 255.0
+        blue, green, red = sample[..., 0], sample[..., 1], sample[..., 2]
 
-        average = QColor(total_r // count, total_g // count, total_b // count)
-        mean = sum(luminances) / len(luminances)
-        variance = sum((value - mean) ** 2 for value in luminances) / len(luminances)
-        complexity = min(1.0, variance ** 0.5 * 3.2)
+        def linearize(channel: np.ndarray) -> np.ndarray:
+            return np.where(channel <= 0.03928, channel / 12.92, ((channel + 0.055) / 1.055) ** 2.4)
+
+        luminance = 0.2126 * linearize(red) + 0.7152 * linearize(green) + 0.0722 * linearize(blue)
+        average = QColor(
+            min(255, round(float(red.mean()) * 255)),
+            min(255, round(float(green.mean()) * 255)),
+            min(255, round(float(blue.mean()) * 255)),
+        )
+        mean_luminance = float(luminance.mean())
+        luminance_range = float(luminance.max() - luminance.min())
+        bright_fraction = float((luminance > 0.68).mean())
+        dark_fraction = float((luminance < 0.16).mean())
+        mid_fraction = float(((luminance >= 0.24) & (luminance <= 0.76)).mean())
+        luminance_std = float(luminance.std())
+        color_std = float(((red.var() + green.var() + blue.var()) / 3.0) ** 0.5)
+
+        edge_x = np.abs(np.diff(luminance, axis=1))
+        edge_y = np.abs(np.diff(luminance, axis=0))
+        edge_count = edge_x.size + edge_y.size
+        edge_density = float((edge_x.sum() + edge_y.sum()) / edge_count) if edge_count else 0.0
+
+        terminal_like = (
+            mean_luminance < 0.32
+            and bright_fraction > 0.018
+            and dark_fraction > 0.48
+            and luminance_range > 0.54
+            and edge_density > 0.018
+        )
+        mixed_text_like = (
+            bright_fraction > 0.05
+            and dark_fraction > 0.18
+            and mid_fraction < 0.78
+            and luminance_range > 0.48
+            and edge_density > 0.02
+        )
+
+        complexity = min(
+            1.0,
+            max(
+                luminance_std * 3.1,
+                color_std * 2.35,
+                edge_density * 7.5,
+                bright_fraction * dark_fraction * luminance_range * 6.0,
+                luminance_std * 1.55 + color_std * 1.15 + edge_density * 3.6,
+                0.58 if terminal_like else 0.0,
+                0.46 if mixed_text_like else 0.0,
+            ),
+        )
         return average, complexity
 
     def _resize_for_content(self, active: list[TodoItem]) -> None:
@@ -1261,7 +1492,7 @@ class LiquidMemoApp:
         self.window = MemoWindow(self)
         self.settings_window = SettingsWindow(self)
         self.history_window = HistoryWindow(self)
-        self.tray_menu: RoundMenu | None = None
+        self.tray_menu: QMenu | None = None
         self.tray = QSystemTrayIcon(tray_icon())
         self.tray.setToolTip("桌面备忘")
         self.tray.activated.connect(self._tray_activated)
@@ -1269,6 +1500,8 @@ class LiquidMemoApp:
         self.qt.aboutToQuit.connect(self.shutdown)
 
     def run(self) -> int:
+        # showEvent already drives the initial geometry/refresh/recolor sequence; scheduling
+        # it again here only rebuilt the list and recolored it a second time.
         self.window.show()
         return self.qt.exec()
 
@@ -1310,7 +1543,45 @@ class LiquidMemoApp:
 
     def show_tray_menu(self) -> None:
         pos = QCursor.pos()
-        menu = RoundMenu("桌面备忘", self.window)
+        menu = QMenu("桌面备忘", self.window)
+        # Translucent + frameless so the rounded corners render cleanly instead of being
+        # clipped by the menu's square native window.
+        menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        menu.setAttribute(Qt.WA_TranslucentBackground)
+        menu.setMinimumWidth(264)
+        menu.setStyleSheet(
+            f"""
+            QMenu {{
+                {FONT_STACK_QSS}
+                background-color: rgb(251, 252, 254);
+                color: rgb(24, 32, 40);
+                border: 1px solid rgba(17,24,32,26);
+                border-radius: 15px;
+                padding: 8px;
+                font-size: 15px;
+            }}
+            QMenu::item {{
+                min-width: 224px;
+                min-height: 40px;
+                padding: 9px 26px 9px 18px;
+                margin: 2px 4px;
+                border-radius: 10px;
+                background-color: transparent;
+            }}
+            QMenu::item:selected {{
+                background-color: rgba(0, 103, 192, 30);
+                color: rgb(0, 71, 138);
+            }}
+            QMenu::icon {{
+                padding-left: 12px;
+            }}
+            QMenu::separator {{
+                height: 1px;
+                margin: 6px 14px;
+                background: rgba(17,24,32,20);
+            }}
+            """
+        )
         self._add_tray_action(menu, FluentIcon.SETTING, "设置", self.show_settings)
         self._add_tray_action(menu, FluentIcon.HISTORY, "历史记录", self.show_history)
         menu.addSeparator()
@@ -1319,9 +1590,9 @@ class LiquidMemoApp:
         self._add_tray_action(menu, icon, label, self.toggle_window)
         self._add_tray_action(menu, FluentIcon.POWER_BUTTON, "退出", self.quit)
         self.tray_menu = menu
-        menu.exec(QPoint(pos.x() - 210, pos.y() - 8))
+        menu.exec(QPoint(pos.x() - 284, pos.y() - 12))
 
-    def _add_tray_action(self, menu: RoundMenu, icon: FluentIcon, text: str, callback) -> None:
+    def _add_tray_action(self, menu: QMenu, icon: FluentIcon, text: str, callback) -> None:
         action = Action(icon, text, menu)
         action.triggered.connect(callback)
         menu.addAction(action)

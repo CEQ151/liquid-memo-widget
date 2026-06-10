@@ -6,16 +6,30 @@ from ctypes import wintypes
 
 user32 = ctypes.windll.user32
 
+GetWindowLongW = user32.GetWindowLongW
+GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+GetWindowLongW.restype = wintypes.LONG
+
+SetWindowLongW = user32.SetWindowLongW
+SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+SetWindowLongW.restype = wintypes.LONG
+
 GWL_EXSTYLE = -20
+GWL_STYLE = -16
+WS_CHILD = 0x40000000
+WS_POPUP = 0x80000000
+WS_VISIBLE = 0x10000000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 WS_EX_NOACTIVATE = 0x08000000
 
+HWND_TOP = 0
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
 SWP_SHOWWINDOW = 0x0040
 
 WM_NCHITTEST = 0x0084
@@ -34,12 +48,20 @@ SendMessageW = user32.SendMessageW
 SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 SendMessageW.restype = wintypes.LPARAM
 
+GetWindowRect = user32.GetWindowRect
+GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+GetWindowRect.restype = wintypes.BOOL
+
+GetParent = user32.GetParent
+GetParent.argtypes = [wintypes.HWND]
+GetParent.restype = wintypes.HWND
+
 
 def apply_tool_window(hwnd: int) -> None:
-    styles = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    styles = GetWindowLongW(hwnd, GWL_EXSTYLE)
     styles |= WS_EX_TOOLWINDOW
     styles &= ~WS_EX_APPWINDOW
-    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, styles)
+    SetWindowLongW(hwnd, GWL_EXSTYLE, ctypes.c_long(styles & 0xFFFFFFFF).value)
 
 
 def set_topmost(hwnd: int, enabled: bool = True) -> None:
@@ -48,38 +70,23 @@ def set_topmost(hwnd: int, enabled: bool = True) -> None:
 
 
 def detach_from_parent(hwnd: int) -> None:
+    # No-op fast path: once the window is a detached top-level popup, re-running the
+    # restyle + SetWindowPos(SWP_FRAMECHANGED) below forces a non-client recalculation and
+    # makes the window flicker. apply_settings() runs on every slider tick, so guard it.
+    styles = GetWindowLongW(hwnd, GWL_STYLE)
+    if (styles & WS_CHILD) == 0 and (styles & WS_POPUP) != 0 and not GetParent(hwnd):
+        return
+    rect = wintypes.RECT()
+    GetWindowRect(hwnd, ctypes.byref(rect))
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    styles &= ~WS_CHILD
+    styles |= WS_POPUP | WS_VISIBLE
+    SetWindowLongW(hwnd, GWL_STYLE, ctypes.c_long(styles & 0xFFFFFFFF).value)
     user32.SetParent(hwnd, 0)
+    user32.SetWindowPos(hwnd, HWND_TOP, rect.left, rect.top, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED)
 
 
 def begin_system_move(hwnd: int) -> None:
     ReleaseCapture()
     SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
-
-
-def set_desktop_layer(hwnd: int) -> bool:
-    """Best-effort WorkerW parenting. Returns False when the shell layout is unavailable."""
-    progman = user32.FindWindowW("Progman", None)
-    if not progman:
-        return False
-
-    result = wintypes.DWORD()
-    user32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0, 1000, ctypes.byref(result))
-
-    workerw = 0
-
-    def enum_windows_proc(top_hwnd, _lparam):
-        nonlocal workerw
-        shell_view = user32.FindWindowExW(top_hwnd, 0, "SHELLDLL_DefView", None)
-        if shell_view:
-            workerw = user32.FindWindowExW(0, top_hwnd, "WorkerW", None)
-        return True
-
-    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(enum_windows_proc)
-    user32.EnumWindows(enum_proc, 0)
-
-    target = workerw or progman
-    if not target:
-        return False
-
-    user32.SetParent(hwnd, target)
-    return True

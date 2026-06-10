@@ -52,11 +52,11 @@ class WindowState:
 
 @dataclass
 class Settings:
-    glassOpacity: float = 0.08
+    glassOpacity: float = 0.0
     liquidStrength: float = 1.0
-    windowTint: str = "#F8FBFF"
+    windowTint: str = "#FFFFFF"
     todoTextColor: str = "#111820"
-    urgentTextColor: str = "#E5484D"
+    urgentTextColor: str = "#FF0000"
     fontColorMode: str = "autoEnhanced"
     completeBehavior: str = "archive"
     layerMode: str = "alwaysVisibleClickThrough"
@@ -73,8 +73,14 @@ class AppState:
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "AppState":
-        settings = Settings(**{**asdict(Settings()), **dict(data.get("settings") or {})})
-        window = WindowState(**{**asdict(WindowState()), **dict(data.get("window") or {})})
+        settings_defaults = asdict(Settings())
+        window_defaults = asdict(WindowState())
+        settings_data = dict(data.get("settings") or {})
+        window_data = dict(data.get("window") or {})
+        settings = Settings(**{key: settings_data.get(key, value) for key, value in settings_defaults.items()})
+        if settings.layerMode != "alwaysVisibleClickThrough":
+            settings.layerMode = "alwaysVisibleClickThrough"
+        window = WindowState(**{key: window_data.get(key, value) for key, value in window_defaults.items()})
         todos = [TodoItem.from_dict(item) for item in data.get("todos") or []]
         history = [TodoItem.from_dict(item) for item in data.get("history") or []]
         return AppState(version=2, settings=settings, window=window, todos=todos, history=history)
