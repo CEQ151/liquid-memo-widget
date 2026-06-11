@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -17,10 +18,62 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# DDL is stored as free text (e.g. "6-15 23:59", "2026/6/15", "6月15日"). For sorting and
+# overdue/near highlighting we make a best-effort parse of common machine-readable forms into
+# a naive local datetime; anything we cannot parse (e.g. "下周一") returns None and is excluded
+# from date-based sorting/highlighting while still displaying its text verbatim.
+_DDL_PATTERNS = [
+    # YYYY-MM-DD or YYYY/MM/DD, optional HH:MM
+    re.compile(r"^(?P<y>\d{4})[-/.](?P<mo>\d{1,2})[-/.](?P<d>\d{1,2})(?:\s+(?P<h>\d{1,2}):(?P<mi>\d{2}))?$"),
+    # MM-DD or M/D (no year), optional HH:MM
+    re.compile(r"^(?P<mo>\d{1,2})[-/.](?P<d>\d{1,2})(?:\s+(?P<h>\d{1,2}):(?P<mi>\d{2}))?$"),
+    # Chinese: YYYY年M月D日 / M月D日, optional H[点时]M?分
+    re.compile(
+        r"^(?:(?P<y>\d{4})年)?(?P<mo>\d{1,2})月(?P<d>\d{1,2})日?"
+        r"(?:\s*(?P<h>\d{1,2})[点时](?:(?P<mi>\d{1,2})分?)?)?$"
+    ),
+]
+
+
+def parse_ddl(text: str, now: datetime | None = None) -> datetime | None:
+    """Best-effort parse of a DDL string into a naive local datetime, or None.
+
+    Year-less inputs assume the current year; if that places the deadline more than ~180 days
+    in the past it rolls to next year (so "1-5" entered in December means next January).
+    A missing time defaults to 23:59 (end of day), matching common deadline semantics.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    now = now or datetime.now()
+    for pattern in _DDL_PATTERNS:
+        match = pattern.match(text)
+        if not match:
+            continue
+        parts = match.groupdict()
+        try:
+            month = int(parts["mo"])
+            day = int(parts["d"])
+            year = int(parts["y"]) if parts.get("y") else now.year
+            hour = int(parts["h"]) if parts.get("h") else 23
+            minute = int(parts["mi"]) if parts.get("mi") else (0 if parts.get("h") else 59)
+            candidate = datetime(year, month, day, hour, minute)
+        except (ValueError, TypeError):
+            return None
+        if not parts.get("y") and (now - candidate).days > 180:
+            try:
+                candidate = candidate.replace(year=year + 1)
+            except ValueError:
+                pass
+        return candidate
+    return None
+
+
 @dataclass
 class TodoItem:
     id: str = field(default_factory=lambda: str(uuid4()))
     text: str = ""
+    ddl: str = ""
     urgent: bool = False
     done: bool = False
     createdAt: str = field(default_factory=utc_now)
@@ -32,6 +85,7 @@ class TodoItem:
         return TodoItem(
             id=str(data.get("id") or uuid4()),
             text=str(data.get("text") or ""),
+            ddl=str(data.get("ddl") or ""),
             urgent=bool(data.get("urgent", False)),
             done=bool(data.get("done", False)),
             createdAt=str(data.get("createdAt") or utc_now()),

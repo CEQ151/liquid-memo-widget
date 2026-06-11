@@ -4,6 +4,7 @@ import ctypes
 import os
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -12,7 +13,7 @@ import numpy as np
 sys.dont_write_bytecode = True
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "0")
 
-from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QRect, QTimer, Qt, QPropertyAnimation
+from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QRect, QTimer, Qt, QPropertyAnimation, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -64,7 +65,7 @@ from WindowsLiquidGlass.src.GPUSharderWidget.one_d3d_widget import (  # noqa: E4
 
 from liquid_effects import build_effect_params, color_overlay_strength
 from startup import is_startup_enabled, set_startup
-from state_store import AppState, Settings, StateStore, TodoItem, utc_now
+from state_store import AppState, Settings, StateStore, TodoItem, parse_ddl, utc_now
 from window_layer import (
     HTCAPTION,
     HTCLIENT,
@@ -90,6 +91,25 @@ MIN_HEIGHT = 320
 MAX_HEIGHT_RATIO = 0.7
 ROW_HEIGHT = 44
 OUTER_X = 26
+# DDL column: a fixed-width deadline column shown to the right of each todo's text,
+# separated from it by a solid vertical line. Width is only reserved from the text
+# column when at least one active todo actually carries a ddl.
+# DDL column width is adaptive: sized to fit the widest deadline text in the current view so
+# dates always show in full, clamped to [MIN, MAX] so a single long string can't blow up the
+# window (anything past MAX still elides).
+DDL_COL_MIN = 64
+DDL_COL_MAX = 240
+DDL_COL_PAD = 6
+DDL_SEP_WIDTH = 1
+# Two extra HBox gaps (text↔separator and separator↔ddl) at the layout's 10px spacing.
+DDL_COL_GAPS = 20
+# Deadline highlighting: a parsed DDL already past "now" turns red; one due within
+# DDL_NEAR_WINDOW turns amber. Unparseable or done items follow the normal text color.
+DDL_OVERDUE_COLOR = "#FF3B30"
+DDL_NEAR_COLOR = "#FF9500"
+DDL_NEAR_WINDOW = timedelta(hours=24)
+# Placeholder shown in an empty (but visible) DDL cell, signalling it is click-to-set.
+DDL_EMPTY_HINT = "＋"
 BUSY_BACKGROUND_ENTER = 0.36
 BUSY_BACKGROUND_EXIT = 0.26
 HIGH_VISIBILITY_COLORS = ["#39FF14", "#C800FF", "#00F5FF", "#FFF200"]
@@ -230,6 +250,25 @@ class TodoTextLabel(QLabel):
         self.setText(text)
 
 
+class DDLCell(TodoTextLabel):
+    """Deadline column label. Emits `clicked` so its row can open the DDL editor; the row also
+    registers it with the native hit-test so the click lands here instead of passing through."""
+
+    clicked = Signal()
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setWordWrap(False)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class DragHandle(QLabel):
     def __init__(self, parent_window: "MemoWindow") -> None:
         super().__init__("⋮⋮", parent_window.content)
@@ -263,7 +302,7 @@ class TodoRow(QFrame):
         super().__init__(parent_window.content)
         self.todo = todo
         self.parent_window = parent_window
-        self._style_signature: tuple[str, bool, bool] | None = None
+        self._style_signature: tuple[str, bool, bool, str] | None = None
         self._halo: QGraphicsDropShadowEffect | None = None
         self.setMinimumHeight(ROW_HEIGHT)
         self.setObjectName("todoRow")
@@ -307,8 +346,28 @@ class TodoRow(QFrame):
         self.text = TodoTextLabel(todo.text)
         self.text.setFont(mixed_font(12))
         self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.apply_text_style(parent_window.text_color_for(todo), parent_window.text_needs_halo())
         layout.addWidget(self.text, 1)
+
+        # DDL column: solid vertical separator + deadline label. Both stay hidden until the
+        # layout pass (apply_text_width) decides the column should be shown for this view.
+        self.ddl_sep = QFrame()
+        self.ddl_sep.setObjectName("ddlSeparator")
+        self.ddl_sep.setFixedWidth(DDL_SEP_WIDTH)
+        self.ddl_sep.setStyleSheet("QFrame#ddlSeparator { background: rgba(25,35,45,110); border: none; }")
+        self.ddl_sep.setVisible(False)
+        layout.addWidget(self.ddl_sep)
+
+        self.ddl_label = DDLCell(todo.ddl)
+        self.ddl_label.setFont(mixed_font(11))
+        self.ddl_label.setFixedWidth(DDL_COL_MIN)  # adaptive width set in apply_text_width
+        self.ddl_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.ddl_label.setToolTip(todo.ddl or "点击设置截止时间")
+        self.ddl_label.setVisible(False)
+        self.ddl_label.clicked.connect(lambda: parent_window.edit_ddl(todo.id))
+        layout.addWidget(self.ddl_label)
+
+        # Style text + ddl together, now that both labels exist.
+        self.apply_text_style(parent_window.text_color_for(todo), parent_window.text_needs_halo())
 
         self.urgent = QPushButton("❗")
         self.urgent.setFixedSize(30, 30)
@@ -329,18 +388,43 @@ class TodoRow(QFrame):
         self.urgent.clicked.connect(lambda: parent_window.toggle_urgent(todo.id))
         layout.addWidget(self.urgent)
 
+    def _ddl_status(self) -> str:
+        # "overdue"/"near"/"normal"/"none" — drives the deadline color. Done items and
+        # cells whose text we cannot parse into a date never get the alert colors.
+        if self.todo.done or not self.todo.ddl.strip():
+            return "none"
+        deadline = parse_ddl(self.todo.ddl)
+        if deadline is None:
+            return "normal"
+        now = datetime.now()
+        if deadline < now:
+            return "overdue"
+        if deadline - now <= DDL_NEAR_WINDOW:
+            return "near"
+        return "normal"
+
     def apply_text_style(self, color: QColor, protect: bool) -> None:
         # Re-applying an identical style (and especially swapping in a brand-new
         # QGraphicsDropShadowEffect) forces a repaint of the row; with the contrast timer
         # firing every few hundred ms that reads as text flicker. Skip no-op updates and
         # reuse the existing halo effect.
-        signature = (color.name(), self.todo.done, protect)
+        ddl_status = self._ddl_status()
+        signature = (color.name(), self.todo.done, protect, ddl_status)
         if signature == self._style_signature:
             return
         self._style_signature = signature
         alpha = 0.45 if self.todo.done else 1.0
         decoration = "text-decoration: line-through;" if self.todo.done else ""
         self.text.setStyleSheet(f"{FONT_STACK_QSS} font-size: 12pt; color: {css_rgba(color, alpha)}; {decoration}")
+        if ddl_status == "overdue":
+            ddl_css = f"color: {DDL_OVERDUE_COLOR}; font-weight: 600;"
+        elif ddl_status == "near":
+            ddl_css = f"color: {DDL_NEAR_COLOR}; font-weight: 600;"
+        elif self.todo.ddl.strip():
+            ddl_css = f"color: {css_rgba(color, alpha * 0.85)};"
+        else:
+            ddl_css = f"color: {css_rgba(color, alpha * 0.4)};"  # faint click-to-set hint
+        self.ddl_label.setStyleSheet(f"{FONT_STACK_QSS} font-size: 11pt; {ddl_css} {decoration}")
         if protect:
             halo = self._halo
             if halo is None:
@@ -357,9 +441,19 @@ class TodoRow(QFrame):
             self._halo = None
             self.text.setGraphicsEffect(None)
 
-    def apply_text_width(self, text_width: int) -> int:
+    def apply_text_width(self, text_width: int, show_ddl: bool = False, ddl_width: int = DDL_COL_MIN) -> int:
         text_width = max(90, text_width)
         self.text.setFixedWidth(text_width)
+        self.ddl_sep.setVisible(show_ddl)
+        self.ddl_label.setVisible(show_ddl)
+        if show_ddl:
+            self.ddl_label.setFixedWidth(ddl_width)
+            raw = self.todo.ddl.strip()
+            if raw:
+                ddl_metrics = QFontMetrics(self.ddl_label.font())
+                self.ddl_label.setText(ddl_metrics.elidedText(raw, Qt.ElideRight, ddl_width))
+            else:
+                self.ddl_label.setText(DDL_EMPTY_HINT)
         metrics = QFontMetrics(self.text.font())
         flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
         rect = metrics.boundingRect(QRect(0, 0, text_width, 2000), flags, self.todo.text)
@@ -415,6 +509,11 @@ class AddTodoPopup(QDialog):
         self.input.setPlaceholderText("输入事项")
         self.input.returnPressed.connect(self.accept)
         layout.addWidget(self.input, 1)
+        self.ddl_input = QLineEdit()
+        self.ddl_input.setPlaceholderText("DDL（可选）")
+        self.ddl_input.setFixedWidth(124)
+        self.ddl_input.returnPressed.connect(self.accept)
+        layout.addWidget(self.ddl_input)
         self.ok = RoundButton("✓", 42, tone="confirm")
         self.ok.clicked.connect(self.accept)
         layout.addWidget(self.ok)
@@ -425,6 +524,7 @@ class AddTodoPopup(QDialog):
         self.panel.setGeometry(0, 0, self.width(), self.height())
         self.move(point)
         self.input.clear()
+        self.ddl_input.clear()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -444,7 +544,83 @@ class AddTodoPopup(QDialog):
     def accept(self) -> None:
         text = self.input.text().strip()
         if text:
-            self.parent_window.add_todo(text)
+            self.parent_window.add_todo(text, self.ddl_input.text().strip())
+        self.hide()
+
+
+class EditDDLPopup(QDialog):
+    """Single-field popup to set/clear the deadline of an existing todo. Mirrors AddTodoPopup's
+    Qt.Tool + click-outside-to-dismiss behavior; the editing target is remembered per open."""
+
+    def __init__(self, parent_window: "MemoWindow") -> None:
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.parent_window = parent_window
+        self._todo_id: str | None = None
+        self.setWindowTitle("设置截止时间")
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFixedSize(320, 74)
+
+        self.panel = QFrame(self)
+        self.panel.setObjectName("addPanel")
+        self.panel.setGeometry(0, 0, self.width(), self.height())
+        self.panel.setStyleSheet(
+            f"""
+            QFrame#addPanel {{
+                {FONT_STACK_QSS}
+                border-radius: 22px;
+                border: 1px solid rgba(255,255,255,170);
+                background: rgba(248,252,255,238);
+            }}
+            QLineEdit {{
+                {FONT_STACK_QSS}
+                border: 1px solid rgba(255,255,255,145);
+                border-radius: 17px;
+                background: rgba(255,255,255,150);
+                color: #111820;
+                font-size: 15px;
+                padding: 7px 12px;
+                selection-background-color: rgba(33,150,243,120);
+            }}
+            """
+        )
+        add_soft_shadow(self.panel, blur=22, y=8, alpha=60)
+
+        layout = QHBoxLayout(self.panel)
+        layout.setContentsMargins(18, 12, 12, 12)
+        layout.setSpacing(10)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("DDL（留空清除）")
+        self.input.returnPressed.connect(self.accept)
+        layout.addWidget(self.input, 1)
+        self.ok = RoundButton("✓", 42, tone="confirm")
+        self.ok.clicked.connect(self.accept)
+        layout.addWidget(self.ok)
+
+    def open_for(self, todo_id: str, current: str, point: QPoint) -> None:
+        self._todo_id = todo_id
+        self.move(point)
+        self.input.setText(current)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(0, lambda: (self.input.setFocus(Qt.PopupFocusReason), self.input.selectAll()))
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.WindowDeactivate:
+            self.hide()
+        return super().event(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            self.hide()
+            return
+        super().keyPressEvent(event)
+
+    def accept(self) -> None:
+        if self._todo_id is not None:
+            self.parent_window.set_ddl(self._todo_id, self.input.text().strip())
+        self._todo_id = None
         self.hide()
 
 
@@ -943,6 +1119,7 @@ class MemoWindow(OneGPUWidget):
         self.layout.addWidget(self.empty, 1)
 
         self.add_popup = AddTodoPopup(self)
+        self.edit_ddl_popup = EditDDLPopup(self)
 
     def protect_content_layer(self) -> None:
         if self.container:
@@ -1123,7 +1300,7 @@ class MemoWindow(OneGPUWidget):
     def _is_interactive_point(self, point: QPoint) -> bool:
         widgets: list[QWidget] = [self.add_button, self.hide_button]
         for row in self._rows.values():
-            widgets.extend([row.checkbox, row.urgent])
+            widgets.extend([row.checkbox, row.urgent, row.ddl_label])
         return any(widget.isVisible() and self._rect_for(widget).adjusted(-4, -4, 4, 4).contains(point) for widget in widgets)
 
     def begin_system_move(self) -> None:
@@ -1219,6 +1396,15 @@ class MemoWindow(OneGPUWidget):
         set_topmost(hwnd, True)
         self._window_layer_applied = True
 
+    @staticmethod
+    def _todo_sort_key(item: TodoItem) -> tuple:
+        # Urgent items stay pinned to the top (existing behavior). Within each group, items
+        # with a parseable deadline sort by it (earliest first); items without a usable date
+        # fall back to their manual order, landing after the dated ones.
+        deadline = parse_ddl(item.ddl)
+        ddl_rank = deadline.timestamp() if deadline else float("inf")
+        return (not item.urgent, ddl_rank, item.order, item.createdAt)
+
     def refresh(self) -> None:
         while self.list_layout.count():
             item = self.list_layout.takeAt(0)
@@ -1226,7 +1412,7 @@ class MemoWindow(OneGPUWidget):
                 item.widget().deleteLater()
         self._rows.clear()
 
-        active = sorted(self.app.state.todos, key=lambda item: (not item.urgent, item.order, item.createdAt))
+        active = sorted(self.app.state.todos, key=self._todo_sort_key)
         self.scroll.setVisible(bool(active))
         self.empty.setVisible(not active)
 
@@ -1377,8 +1563,11 @@ class MemoWindow(OneGPUWidget):
 
     def _resize_for_content(self, active: list[TodoItem]) -> None:
         screen = QApplication.primaryScreen().availableGeometry()
-        width = self._adaptive_width(active, screen)
-        text_width = self._text_width_for_window(width)
+        show_ddl = any(todo.ddl for todo in active)
+        ddl_width = self._ddl_column_width(active) if show_ddl else 0
+        ddl_reserve = (ddl_width + DDL_SEP_WIDTH + DDL_COL_GAPS) if show_ddl else 0
+        width = self._adaptive_width(active, screen, ddl_reserve)
+        text_width = self._text_width_for_window(width, ddl_reserve)
         row_heights = [self._row_height_for(todo, text_width) for todo in active]
         content_height = sum(row_heights) if row_heights else ROW_HEIGHT
         wanted = max(MIN_HEIGHT, 104 + content_height)
@@ -1390,23 +1579,30 @@ class MemoWindow(OneGPUWidget):
                 self.container.setFixedSize(width, height)
 
         for row in self._rows.values():
-            row.apply_text_width(text_width)
+            row.apply_text_width(text_width, show_ddl, ddl_width)
 
         self._keep_inside_screen(screen)
         self.app.state.window.width = width
         self.app.state.window.height = height
 
-    def _adaptive_width(self, active: list[TodoItem], screen: QRect) -> int:
+    def _adaptive_width(self, active: list[TodoItem], screen: QRect, ddl_reserve: int = 0) -> int:
         if not active:
             return MIN_WIDTH
         metrics = QFontMetrics(mixed_font(12))
         longest = max(metrics.horizontalAdvance(todo.text) for todo in active)
-        chrome = OUTER_X * 2 + 12 + 18 + 30 + 28 + 24
+        chrome = OUTER_X * 2 + 12 + 18 + 30 + 28 + 24 + ddl_reserve
         max_width = min(MAX_WIDTH, int(screen.width() * MAX_WIDTH_RATIO), screen.width() - 64)
         return max(MIN_WIDTH, min(max_width, longest + chrome))
 
-    def _text_width_for_window(self, width: int) -> int:
-        return max(90, width - (OUTER_X * 2 + 12 + 18 + 30 + 28 + 12))
+    def _text_width_for_window(self, width: int, ddl_reserve: int = 0) -> int:
+        return max(90, width - (OUTER_X * 2 + 12 + 18 + 30 + 28 + 12) - ddl_reserve)
+
+    def _ddl_column_width(self, active: list[TodoItem]) -> int:
+        # Width that fits the widest deadline text in this view (so dates show in full),
+        # clamped to [DDL_COL_MIN, DDL_COL_MAX]. Beyond MAX the row label still elides.
+        metrics = QFontMetrics(mixed_font(11))
+        longest = max((metrics.horizontalAdvance(todo.ddl.strip()) for todo in active if todo.ddl.strip()), default=0)
+        return max(DDL_COL_MIN, min(DDL_COL_MAX, longest + DDL_COL_PAD))
 
     def _row_height_for(self, todo: TodoItem, text_width: int) -> int:
         metrics = QFontMetrics(mixed_font(12))
@@ -1435,9 +1631,32 @@ class MemoWindow(OneGPUWidget):
         y = min(max(y, screen.top() + 12), screen.bottom() - popup_height - 12)
         self.add_popup.open_near(QPoint(x, y), popup_width)
 
-    def add_todo(self, text: str) -> None:
+    def add_todo(self, text: str, ddl: str = "") -> None:
         next_order = max([todo.order for todo in self.app.state.todos] + [0]) + 1
-        self.app.state.todos.append(TodoItem(id=str(uuid4()), text=text, order=next_order))
+        self.app.state.todos.append(TodoItem(id=str(uuid4()), text=text, ddl=ddl, order=next_order))
+        self.app.save()
+        self.refresh()
+
+    def edit_ddl(self, todo_id: str) -> None:
+        todo = next((item for item in self.app.state.todos if item.id == todo_id), None)
+        if todo is None:
+            return
+        row = self._rows.get(todo_id)
+        screen = QApplication.primaryScreen().availableGeometry()
+        popup = self.edit_ddl_popup
+        if row is not None:
+            anchor = row.ddl_label.mapToGlobal(QPoint(0, row.ddl_label.height() + 6))
+        else:
+            anchor = QPoint(self.x(), self.y() + self.height() + 10)
+        x = min(max(anchor.x(), screen.left() + 12), screen.right() - popup.width() - 12)
+        y = min(max(anchor.y(), screen.top() + 12), screen.bottom() - popup.height() - 12)
+        popup.open_for(todo_id, todo.ddl, QPoint(x, y))
+
+    def set_ddl(self, todo_id: str, ddl: str) -> None:
+        todo = next((item for item in self.app.state.todos if item.id == todo_id), None)
+        if todo is None or todo.ddl == ddl:
+            return
+        todo.ddl = ddl
         self.app.save()
         self.refresh()
 
