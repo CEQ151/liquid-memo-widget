@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -27,11 +28,12 @@ CREATE_NO_WINDOW = 0x08000000
 class ReleaseInfo:
     tag: str                 # e.g. "v1.0.0"
     version: str             # e.g. "1.0.0"
-    notes: str               # release body (markdown)
+    notes: str               # release body (markdown, or HTML from the atom feed)
     html_url: str
     installer_url: str       # "" when the release has no Setup asset
     installer_name: str
     installer_size: int
+    notes_html: bool = False  # True when notes came from the atom feed (HTML)
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -81,12 +83,66 @@ def _release_from_payload(data: dict) -> ReleaseInfo:
     )
 
 
+def _fetch_atom_releases() -> list[ReleaseInfo]:
+    """Fallback source: the public releases.atom feed on github.com.
+
+    Unlike api.github.com (60 anonymous requests/hour per IP, easily exhausted
+    behind shared NAT), the atom feed is not rate limited. It carries the tag,
+    release page link and HTML notes; the installer URL is reconstructed from
+    the packaging scripts' fixed asset naming, and the download itself goes to
+    objects.githubusercontent.com which is also not rate limited.
+    """
+    request = urllib.request.Request(
+        f"{GITHUB_URL}/releases.atom",
+        headers={"User-Agent": f"{GITHUB_REPO}-updater"},
+    )
+    with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
+        root = ET.fromstring(response.read())
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    releases: list[ReleaseInfo] = []
+    for entry in root.findall("a:entry", ns):
+        tag = (entry.findtext("a:id", "", ns) or "").rsplit("/", 1)[-1]
+        if not tag:
+            continue
+        link = entry.find("a:link", ns)
+        installer_name = f"LiquidMemoWidget-Setup-{tag}.exe"
+        releases.append(ReleaseInfo(
+            tag=tag,
+            version=tag.lstrip("vV"),
+            notes=entry.findtext("a:content", "", ns) or "",
+            html_url=(link.get("href") if link is not None else None) or f"{GITHUB_URL}/releases",
+            installer_url=f"{GITHUB_URL}/releases/download/{tag}/{installer_name}",
+            installer_name=installer_name,
+            installer_size=0,
+            notes_html=True,
+        ))
+    if not releases:
+        raise RuntimeError("无法从发布源获取版本信息")
+    return releases
+
+
 def fetch_latest_release() -> ReleaseInfo:
-    return _release_from_payload(_get_json(f"{API_BASE}/releases/latest"))
+    try:
+        return _release_from_payload(_get_json(f"{API_BASE}/releases/latest"))
+    except Exception as api_error:
+        try:
+            # Atom entries are ordered newest-first.
+            return _fetch_atom_releases()[0]
+        except Exception:
+            raise api_error
 
 
 def fetch_release_by_tag(tag: str) -> ReleaseInfo:
-    return _release_from_payload(_get_json(f"{API_BASE}/releases/tags/{tag}"))
+    try:
+        return _release_from_payload(_get_json(f"{API_BASE}/releases/tags/{tag}"))
+    except Exception as api_error:
+        try:
+            for release in _fetch_atom_releases():
+                if release.tag == tag:
+                    return release
+        except Exception:
+            pass
+        raise api_error
 
 
 def download_installer(release: ReleaseInfo,
