@@ -979,7 +979,7 @@ class _ReleaseCardDialog(QDialog):
         titles.addWidget(subtitle_label)
         self.body.addLayout(titles)
 
-    def add_notes(self, markdown: str) -> None:
+    def add_notes(self, text: str, html: bool = False) -> None:
         scroll = SmoothScrollArea(self.frame)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -992,8 +992,10 @@ class _ReleaseCardDialog(QDialog):
             """
         )
         notes = QLabel()
-        notes.setTextFormat(Qt.MarkdownText)
-        notes.setText(markdown.strip() or "_暂无更新说明_")
+        # Release notes come as markdown from the GitHub API, or as HTML when
+        # the rate-limited API fell back to the releases.atom feed.
+        notes.setTextFormat(Qt.RichText if html else Qt.MarkdownText)
+        notes.setText(text.strip() or ("暂无更新说明" if html else "_暂无更新说明_"))
         notes.setWordWrap(True)
         notes.setOpenExternalLinks(True)
         notes.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -1037,7 +1039,7 @@ class UpdateDialog(_ReleaseCardDialog):
         self._signals: _DownloadSignals | None = None
         self.setWindowTitle("发现新版本")
         self.add_header(f"发现新版本 {release.tag}", f"当前版本 v{APP_VERSION}，更新内容：")
-        self.add_notes(release.notes)
+        self.add_notes(release.notes, release.notes_html)
 
         self.progress = ProgressBar(self.frame)
         self.progress.setRange(0, 100)
@@ -1105,11 +1107,11 @@ class UpdateDialog(_ReleaseCardDialog):
 
 
 class ChangelogDialog(_ReleaseCardDialog):
-    def __init__(self, notes: str) -> None:
+    def __init__(self, notes: str, html: bool = False) -> None:
         super().__init__(520, 520)
         self.setWindowTitle("更新日志")
         self.add_header("更新完成 🎉", f"桌面备忘已更新到 v{APP_VERSION}，本次更新内容：")
-        self.add_notes(notes)
+        self.add_notes(notes, html)
         buttons = QHBoxLayout()
         buttons.addStretch()
         ok = PrimaryPushButton("知道了", self.frame, FluentIcon.ACCEPT)
@@ -2861,7 +2863,7 @@ class UpdateManager:
                 # Show this version's release notes once after an update.
                 self._fetch(
                     tag=f"v{APP_VERSION}",
-                    on_done=lambda release: self._show_changelog(release.notes),
+                    on_done=lambda release: self._show_changelog(release.notes, release.notes_html),
                     on_fail=lambda _msg: self._show_changelog(
                         f"更新说明获取失败，可前往 [GitHub 发布页]({GITHUB_URL}/releases) 查看。"
                     ),
@@ -2902,8 +2904,8 @@ class UpdateManager:
         self._checking = False
         self.app.settings_window.set_update_status("" if silent else f"检查更新失败：{message}")
 
-    def _show_changelog(self, notes: str) -> None:
-        self._show_dialog(ChangelogDialog(notes))
+    def _show_changelog(self, notes: str, html: bool = False) -> None:
+        self._show_dialog(ChangelogDialog(notes, html))
 
     def _show_dialog(self, dialog: QDialog) -> None:
         self._dialog = dialog
