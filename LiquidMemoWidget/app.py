@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import sys
 import time
@@ -81,6 +82,7 @@ from liquid_effects import build_effect_params, color_overlay_strength
 from startup import is_startup_enabled, set_startup
 from state_store import AppState, CalendarEvent, Settings, StateStore, TodoItem, parse_ddl, utc_now
 import calendar_sync
+from wheel_hook import GlobalWheelHook
 from window_layer import (
     HTCAPTION,
     HTCLIENT,
@@ -114,6 +116,7 @@ OUTER_X = 26
 # window (anything past MAX still elides).
 DDL_COL_MIN = 64
 DDL_COL_MAX = 240
+DDL_COL_EXPANDED_MAX = 600  # in expanded mode the time column may grow to avoid any elision
 DDL_COL_PAD = 6
 DDL_SEP_WIDTH = 1
 # Two extra HBox gaps (text↔separator and separator↔ddl) at the layout's 10px spacing.
@@ -1282,10 +1285,41 @@ class SettingsWindow(QDialog):
             self.app.calendar.on_settings_changed()
 
 
+# Fixed vertical chrome inside the window that is NOT glass padding: the top bar (drag handle +
+# buttons), its spacing to the list, and the scroll's inner margins. The window height is solved
+# so that, after the proportional glass padding, this block + the rows + corner margin all fit
+# inside the glass. (Originally folded into a 104px magic constant alongside the static margins.)
+MEMO_TOP_BLOCK = 68
+
+
+class GlassSkin:
+    """Liquid-glass skin: defines the background geometry and the content insets that keep rows
+    inside the visible glass. The glass rounded-rect is the window scaled by `geometry_scale`, so
+    it leaves a margin proportional to the window size on every side; content must inset by that
+    same proportional padding or it spills into the transparent gap (most visible at the bottom
+    once the window grows tall, e.g. in expanded mode).
+
+    Future skins (e.g. a flat translucent panel for low-end PCs) can set geometry_scale = 1.0
+    (no padding, content fills the window) and uses_glass = False; the inset math below degrades
+    to the static corner margin with no special-casing."""
+
+    geometry_scale = 0.94
+    radius_ratio = 0.24
+    corner_margin = 8  # rounded-corner avoidance + a little breathing room
+    uses_glass = True
+
+    def vertical_padding(self, height: int) -> int:
+        return round(height * (1.0 - self.geometry_scale) / 2.0)
+
+    def horizontal_padding(self, width: int) -> int:
+        return round(width * (1.0 - self.geometry_scale) / 2.0)
+
+
 class MemoWindow(OneGPUWidget):
     def __init__(self, app: "LiquidMemoApp") -> None:
         super().__init__(qt_move=False)
         self.app = app
+        self.skin = GlassSkin()
         self.setWindowTitle("桌面备忘")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -1293,6 +1327,9 @@ class MemoWindow(OneGPUWidget):
         self._rows: dict[str, TodoRow] = {}
         self._event_rows: dict[str, CalendarRow] = {}
         self._calendar_header: QLabel | None = None
+        # Expanded mode grows the window to fit all content (no height clamp, no scrollbar, no
+        # elided text); collapsed mode keeps the default clamp + scroll behavior.
+        self._expanded = False
         self._shown_once = False
         self._sampled_background = QColor(246, 248, 252)
         self._background_complexity = 0.0
@@ -1319,6 +1356,10 @@ class MemoWindow(OneGPUWidget):
         self._contrast_refresh_timer.setSingleShot(True)
         self._contrast_refresh_timer.timeout.connect(lambda: self.update_auto_contrast(force=True))
         self._build_content()
+        # Global wheel hook: scroll the list whenever the cursor is over it, bypassing the
+        # click-through hit-testing that otherwise sends wheel events to the desktop below.
+        self._wheel_hook = GlobalWheelHook(self._on_global_wheel)
+        self._wheel_hook.install()
 
     def schedule_contrast_refresh(self, delay: int = 180) -> None:
         if self.app.state.settings.fontColorMode == "manual":
@@ -1340,6 +1381,10 @@ class MemoWindow(OneGPUWidget):
         self.drag_handle = DragHandle(self)
         top.addWidget(self.drag_handle)
         top.addStretch()
+        self.expand_button = RoundButton("▾", tone="neutral")
+        self.expand_button.setToolTip("展开全部")
+        self.expand_button.clicked.connect(self.toggle_expanded)
+        top.addWidget(self.expand_button)
         self.add_button = RoundButton("+", tone="add")
         self.add_button.setToolTip("添加注意事项")
         self.add_button.clicked.connect(self.show_add_popup)
@@ -1354,7 +1399,13 @@ class MemoWindow(OneGPUWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollBar:vertical { width: 6px; background: transparent; } QScrollBar::handle:vertical { background: rgba(17,24,32,70); border-radius: 3px; }")
+        self.scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            " QScrollBar:vertical { width: 9px; background: transparent; margin: 2px 1px; }"
+            " QScrollBar::handle:vertical { background: rgba(17,24,32,80); border-radius: 4px; min-height: 36px; }"
+            " QScrollBar::handle:vertical:hover { background: rgba(17,24,32,130); }"
+            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
         self.list_widget = QWidget()
         self.list_widget.setStyleSheet("background: transparent;")
         self.list_layout = QVBoxLayout(self.list_widget)
@@ -1548,13 +1599,16 @@ class MemoWindow(OneGPUWidget):
         return QRect(top_left, widget.size())
 
     def _is_interactive_point(self, point: QPoint) -> bool:
-        widgets: list[QWidget] = [self.add_button, self.hide_button]
+        widgets: list[QWidget] = [self.add_button, self.hide_button, self.expand_button]
         for row in self._rows.values():
             # ddl_label is the editable DDLCell (click-to-edit); the time cell on calendar rows
             # is display-only, so only their checkbox is interactive.
             widgets.extend([row.checkbox, row.urgent, row.ddl_label])
         for row in self._event_rows.values():
             widgets.append(row.checkbox)
+        # Wheel scrolling over the list is handled by the global wheel hook (see
+        # _on_global_wheel), so the list area can stay click-through: only the discrete controls
+        # below are interactive, everything else passes clicks to the desktop.
         return any(widget.isVisible() and self._rect_for(widget).adjusted(-4, -4, 4, 4).contains(point) for widget in widgets)
 
     def begin_system_move(self) -> None:
@@ -1711,6 +1765,31 @@ class MemoWindow(OneGPUWidget):
     def toggle_calendar_event(self, key: str, checked: bool) -> None:
         self.app.calendar.toggle_event_done(key, checked)
 
+    def toggle_expanded(self) -> None:
+        self._expanded = not self._expanded
+        self.expand_button.setText("▴" if self._expanded else "▾")
+        self.expand_button.setToolTip("收起" if self._expanded else "展开全部")
+        self.refresh()
+
+    def _scroll_overflowing(self) -> bool:
+        bar = self.scroll.verticalScrollBar()
+        return bar is not None and bar.maximum() > 0
+
+    def _on_global_wheel(self, gx: int, gy: int, delta: int) -> bool:
+        # Invoked from the low-level mouse hook on the GUI thread's message pump. Scroll only
+        # when the list is visible, overflowing, and the cursor is over the scroll area; else
+        # return False so the wheel passes through to whatever is underneath.
+        if not self.isVisible() or not self.scroll.isVisible() or not self._scroll_overflowing():
+            return False
+        local = self.mapFromGlobal(QPoint(gx, gy))
+        if not self._rect_for(self.scroll).contains(local):
+            return False
+        bar = self.scroll.verticalScrollBar()
+        if bar is None:
+            return False
+        bar.setValue(bar.value() - round(delta / 120.0 * 60))
+        return True
+
     def _normal_text_color(self) -> QColor:
         settings = self.app.state.settings
         if settings.fontColorMode == "manual":
@@ -1862,7 +1941,7 @@ class MemoWindow(OneGPUWidget):
         # The time column is shared by todo DDLs and event times; show it (and reserve width)
         # whenever either group needs it, sizing to the widest string across both for alignment.
         column_active = show_todo_ddl or bool(events)
-        ddl_width = self._time_column_width(active, events) if column_active else 0
+        ddl_width = self._time_column_width(active, events, self._expanded) if column_active else 0
         ddl_reserve = (ddl_width + DDL_SEP_WIDTH + DDL_COL_GAPS) if column_active else 0
         width = self._adaptive_width(active, events, screen, ddl_reserve)
         text_width = self._text_width_for_window(width, ddl_reserve)
@@ -1870,13 +1949,34 @@ class MemoWindow(OneGPUWidget):
         if events:
             content_height += CALENDAR_HEADER_HEIGHT + ROW_HEIGHT * len(events)
         content_height = max(content_height, ROW_HEIGHT)
-        wanted = max(MIN_HEIGHT, 104 + content_height)
-        height = min(wanted, int(screen.height() * MAX_HEIGHT_RATIO), screen.height() - 64)
+        # Solve the window height so that, after the glass's proportional vertical padding, the
+        # top block + rows + corner margin still fit inside the glass: H*scale = needed.
+        scale = self.skin.geometry_scale
+        corner = self.skin.corner_margin
+        needed = MEMO_TOP_BLOCK + content_height + 2 * corner
+        wanted = max(MIN_HEIGHT, math.ceil(needed / scale))
+        screen_cap = screen.height() - 64
+        if self._expanded:
+            # Grow to fit everything; only the physical screen limits us. Hide the scrollbar
+            # when it all fits, but fall back to AsNeeded if content still exceeds the screen.
+            height = min(wanted, screen_cap)
+            fits = wanted <= screen_cap
+            self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff if fits else Qt.ScrollBarAsNeeded)
+        else:
+            height = min(wanted, int(screen.height() * MAX_HEIGHT_RATIO), screen_cap)
+            self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         if self.width() != width or self.height() != height:
-            self.update_sdf(width, height, radius_ratio=0.24, scale=0.94)
+            self.update_sdf(width, height, radius_ratio=self.skin.radius_ratio, scale=scale)
             if self.container:
                 self.container.setFixedSize(width, height)
+
+        # Inset the content to the glass. Vertical follows the proportional glass padding so the
+        # bottom rows never cross the glass edge; horizontal keeps OUTER_X, which at our width
+        # range always already exceeds the glass's horizontal padding (so no change there).
+        pad_y = self.skin.vertical_padding(height)
+        pad_x = max(OUTER_X, self.skin.horizontal_padding(width))
+        self.layout.setContentsMargins(pad_x, pad_y + corner, pad_x, pad_y + corner)
 
         for row in self._rows.values():
             row.apply_text_width(text_width, show_todo_ddl, ddl_width)
@@ -1901,14 +2001,16 @@ class MemoWindow(OneGPUWidget):
     def _text_width_for_window(self, width: int, ddl_reserve: int = 0) -> int:
         return max(90, width - (OUTER_X * 2 + 12 + 18 + 30 + 28 + 12) - ddl_reserve)
 
-    def _time_column_width(self, active: list[TodoItem], events: list[CalendarEvent]) -> int:
+    def _time_column_width(self, active: list[TodoItem], events: list[CalendarEvent], expanded: bool = False) -> int:
         # Width that fits the widest deadline/event-time text in this view (so they show in
-        # full), clamped to [DDL_COL_MIN, DDL_COL_MAX]. Beyond MAX the cell still elides.
+        # full), clamped to [DDL_COL_MIN, cap]. Collapsed elides past DDL_COL_MAX; expanded
+        # lifts the cap so nothing is truncated.
         metrics = QFontMetrics(mixed_font(11))
         candidates = [todo.ddl.strip() for todo in active if todo.ddl.strip()]
         candidates += [format_event_time(event) for event in events]
         longest = max((metrics.horizontalAdvance(text) for text in candidates), default=0)
-        return max(DDL_COL_MIN, min(DDL_COL_MAX, longest + DDL_COL_PAD))
+        cap = DDL_COL_EXPANDED_MAX if expanded else DDL_COL_MAX
+        return max(DDL_COL_MIN, min(cap, longest + DDL_COL_PAD))
 
     def _row_height_for(self, todo: TodoItem, text_width: int) -> int:
         metrics = QFontMetrics(mixed_font(12))
@@ -2258,6 +2360,10 @@ class LiquidMemoApp:
 
     def shutdown(self) -> None:
         self.save()
+        try:
+            self.window._wheel_hook.uninstall()
+        except Exception:
+            pass
         try:
             self.window.cleanup()
         except Exception:
