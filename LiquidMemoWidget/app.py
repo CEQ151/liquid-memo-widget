@@ -1692,14 +1692,12 @@ class MemoWindow(OneGPUWidget):
         self.apply_text_colors()
 
     def _visible_calendar_events(self) -> list[CalendarEvent]:
-        settings = self.app.state.settings
-        if not settings.calendarEnabled:
+        # Synced events are read-only and never archive to history (they would just re-sync),
+        # so unlike todos they ignore completeBehavior: checking one only dims + strikes it
+        # through in place and it stays visible until it drops out of the sync window.
+        if not self.app.state.settings.calendarEnabled:
             return []
-        events = list(self.app.state.calendarEvents)
-        if settings.completeBehavior == "archive":
-            done = set(self.app.state.calendarDoneKeys)
-            events = [event for event in events if event.key not in done]
-        return events
+        return list(self.app.state.calendarEvents)
 
     def _make_calendar_header(self) -> QLabel:
         header = QLabel("日程")
