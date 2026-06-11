@@ -106,6 +106,10 @@ class WindowState:
 
 @dataclass
 class Settings:
+    # Rendering skin. "acrylic" is a lightweight DWM frosted-glass surface (no GPU screen
+    # capture) for low-end PCs and is the default; "glass" is the original real-time D3D
+    # liquid-glass refraction. Any other value normalizes to "acrylic" in from_dict.
+    skin: str = "acrylic"
     glassOpacity: float = 0.0
     liquidStrength: float = 1.0
     windowTint: str = "#FFFFFF"
@@ -167,6 +171,8 @@ class AppState:
         settings = Settings(**{key: settings_data.get(key, value) for key, value in settings_defaults.items()})
         if settings.layerMode != "alwaysVisibleClickThrough":
             settings.layerMode = "alwaysVisibleClickThrough"
+        if settings.skin not in ("acrylic", "glass"):
+            settings.skin = "acrylic"
         settings.calendarSyncDays = max(1, min(30, int(settings.calendarSyncDays or 7)))
         window = WindowState(**{key: window_data.get(key, value) for key, value in window_defaults.items()})
         todos = [TodoItem.from_dict(item) for item in data.get("todos") or []]
