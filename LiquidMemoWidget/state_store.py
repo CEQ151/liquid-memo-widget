@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 
-APP_DIR = Path.home() / "AppData" / "Roaming" / "DesktopMemoWidget"
+APP_DIR = Path.home() / "AppData" / "Roaming" / "DesktopMemo_Pro"
 STATE_PATH = APP_DIR / "liquid-state.json"
 
 
