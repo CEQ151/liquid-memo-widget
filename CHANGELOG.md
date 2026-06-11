@@ -4,6 +4,11 @@
 release 工作流会提取对应小节作为 GitHub Release 的说明（缺失则构建失败），
 应用内的更新弹窗和「更新完成」日志展示的也是这段内容。
 
+## v1.0.2 - 2026-06-11
+
+### 修复
+- 修复 v1.0.1 安装版启动即崩溃（`ModuleNotFoundError: No module named 'xml.etree'`）：打包配置遗漏了标准库 `xml.etree`，现已显式打入安装包
+
 ## v1.0.1 - 2026-06-11
 
 ### 修复
