@@ -90,23 +90,49 @@ jobs:
             Where-Object { $_.Name -match '\.(exe|zip)$' } |
             Select-Object FullName, Length
 
+      # The release body comes from this version's section in CHANGELOG.md, so every
+      # release documents its changes in detail. A tag without a matching changelog
+      # section fails the build on purpose. The in-app update dialog and post-update
+      # changelog render this same text.
+      - name: Compose release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          $lines = Get-Content CHANGELOG.md -Encoding utf8
+          $pattern = "^##\s+v?$([regex]::Escape($env:APP_VERSION))(\s|$)"
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match $pattern) { $start = $i; break }
+          }
+          if ($start -lt 0) {
+            throw "CHANGELOG.md has no '## v$env:APP_VERSION' section. Document the changes before tagging a release."
+          }
+          $end = $lines.Count
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^##\s') { $end = $i; break }
+          }
+          $section = ($lines[($start + 1)..($end - 1)] -join "`n").Trim()
+          if (-not $section) {
+            throw "The '## v$env:APP_VERSION' section in CHANGELOG.md is empty. Document the changes before tagging."
+          }
+          $body = @()
+          $body += "## Liquid Memo Widget $env:RELEASE_VERSION"
+          $body += ""
+          $body += $section
+          $body += ""
+          $body += "### 下载"
+          $body += "- ``LiquidMemoWidget-Setup-$env:RELEASE_VERSION.exe``：Windows 安装包（支持应用内自动更新）"
+          $body += "- ``LiquidMemoWidget-Portable-$env:RELEASE_VERSION.zip``：免安装便携版"
+          $body -join "`n" | Set-Content release_body.md -Encoding utf8
+          Get-Content release_body.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
           name: Liquid Memo Widget ${{ env.RELEASE_VERSION }}
-          # Appends an auto-generated changelog (merged PRs / commits) to the body;
-          # the in-app update dialog and post-update changelog render this text.
+          body_path: release_body.md
+          # Appends an auto-generated "What's Changed" commit list after the body.
           generate_release_notes: true
-          body: |
-            ## Liquid Memo Widget ${{ env.RELEASE_VERSION }}
-
-            ### Downloads
-            - `LiquidMemoWidget-Setup-${{ env.RELEASE_VERSION }}.exe`: Windows installer
-            - `LiquidMemoWidget-Portable-${{ env.RELEASE_VERSION }}.zip`: portable build
-
-            ### Notes
-            This release integrates the Liquid Glass rendering core from [ai12989757/WindowsLiquidGlass](https://github.com/ai12989757/WindowsLiquidGlass). See `THIRD_PARTY_NOTICES.md`.
           files: |
             dist/installer/LiquidMemoWidget-Setup-${{ env.RELEASE_VERSION }}.exe
             dist/LiquidMemoWidget-Portable-${{ env.RELEASE_VERSION }}.zip
