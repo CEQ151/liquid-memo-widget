@@ -28,7 +28,11 @@ pythonw .\RunLiquidMemoWidget.pyw
 
 There are **no automated tests and no linter configured**. `one_d3d_widget.py` has a manual
 `__main__` smoke-test entry that renders a standalone glass square. Releases are produced by
-`.github/workflows/release.yml`, triggered by pushing a `v*` tag.
+`.github/workflows/release.yml`, triggered by pushing a `v*` tag. **Before tagging a release:**
+bump `APP_VERSION` in `LiquidMemoWidget/version.py` and add a `## vX.Y.Z` section to
+`CHANGELOG.md` documenting the changes — the workflow extracts that section as the GitHub
+Release body (and fails without it); the in-app update dialog and post-update changelog
+render the same text.
 
 ## Architecture
 
