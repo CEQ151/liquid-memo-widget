@@ -1945,9 +1945,13 @@ class MemoWindow(OneGPUWidget):
         ddl_reserve = (ddl_width + DDL_SEP_WIDTH + DDL_COL_GAPS) if column_active else 0
         width = self._adaptive_width(active, events, screen, ddl_reserve)
         text_width = self._text_width_for_window(width, ddl_reserve)
-        content_height = sum(self._row_height_for(todo, text_width) for todo in active)
+        content_height = sum(self._measure_row_height(todo.text, text_width) for todo in active)
         if events:
-            content_height += CALENDAR_HEADER_HEIGHT + ROW_HEIGHT * len(events)
+            # Calendar rows render "📅 {summary}", which wraps (and grows taller than ROW_HEIGHT)
+            # for long titles — measure them like todos so the window height isn't underestimated
+            # (which previously left expanded mode hiding the scrollbar yet still clipping rows).
+            content_height += CALENDAR_HEADER_HEIGHT
+            content_height += sum(self._measure_row_height(f"📅 {event.summary}", text_width) for event in events)
         content_height = max(content_height, ROW_HEIGHT)
         # Solve the window height so that, after the glass's proportional vertical padding, the
         # top block + rows + corner margin still fit inside the glass: H*scale = needed.
@@ -2012,10 +2016,10 @@ class MemoWindow(OneGPUWidget):
         cap = DDL_COL_EXPANDED_MAX if expanded else DDL_COL_MAX
         return max(DDL_COL_MIN, min(cap, longest + DDL_COL_PAD))
 
-    def _row_height_for(self, todo: TodoItem, text_width: int) -> int:
+    def _measure_row_height(self, text: str, text_width: int) -> int:
         metrics = QFontMetrics(mixed_font(12))
         flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
-        rect = metrics.boundingRect(QRect(0, 0, max(90, text_width), 2000), flags, todo.text)
+        rect = metrics.boundingRect(QRect(0, 0, max(90, text_width), 2000), flags, text)
         return max(ROW_HEIGHT, rect.height() + 18)
 
     def _keep_inside_screen(self, screen: QRect) -> None:
