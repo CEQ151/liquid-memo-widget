@@ -2,7 +2,7 @@
 # APP_VERSION from the pushed tag before building, so a tagged build always
 # reports the tag's version.
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 GITHUB_OWNER = "CEQ151"
 GITHUB_REPO = "liquid-memo-widget"
