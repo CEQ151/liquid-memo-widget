@@ -119,6 +119,9 @@ class Settings:
     completeBehavior: str = "archive"
     layerMode: str = "alwaysVisibleClickThrough"
     startWithWindows: bool = False
+    # When True, dragging the window to a screen edge docks it and it auto-hides off-screen
+    # (leaving a thin peek strip) until the cursor returns to that strip.
+    edgeAutoHide: bool = True
     # Calendar subscription: when enabled, the widget syncs the next `calendarSyncDays` days of
     # events from an ICS/webcal URL and shows them in a separate "日程" group.
     calendarEnabled: bool = False

@@ -155,6 +155,16 @@ _SAMPLE_DIM = 44
 REST_FPS = 20
 MOVE_FPS = 30
 
+# Edge auto-hide ("dock"): when the window is dragged within DOCK_THRESHOLD px of a work-area
+# edge (left/right/top) it snaps flush and, once the cursor leaves, slides off-screen leaving a
+# DOCK_PEEK-px strip. Moving the cursor back onto that strip slides it out again.
+WM_MOUSEMOVE = 0x0200
+DOCK_THRESHOLD = 18
+DOCK_PEEK = 5
+DOCK_HIDE_DELAY_MS = 600
+DOCK_SLIDE_MS = 200
+DOCK_POLL_MS = 120
+
 
 def _dwm_flush() -> None:
     try:
@@ -1030,6 +1040,11 @@ class SettingsWindow(QDialog):
         self.position.currentIndexChanged.connect(self._apply)
         self.startup = self._switch_row("开机自启动", "登录 Windows 后自动启动桌面备忘。", self._last_startup_checked)
         self.startup.checkedChanged.connect(lambda _checked: self._apply())
+        self.edge_autohide = self._switch_row(
+            "贴边自动隐藏", "把窗口拖到屏幕左/右/上边缘即停靠，鼠标离开后自动滑出隐藏，移回边缘再滑回。",
+            self.app.state.settings.edgeAutoHide,
+        )
+        self.edge_autohide.checkedChanged.connect(lambda _checked: self._apply())
 
         self._section("日历订阅")
         self.calendar_enabled = self._switch_row(
@@ -1213,6 +1228,7 @@ class SettingsWindow(QDialog):
             self.complete.blockSignals(True),
             self.position.blockSignals(True),
             self.startup.blockSignals(True),
+            self.edge_autohide.blockSignals(True),
             self.calendar_enabled.blockSignals(True),
             self.calendar_url.blockSignals(True),
             self.calendar_days.blockSignals(True),
@@ -1230,13 +1246,14 @@ class SettingsWindow(QDialog):
         self.position.setCurrentIndex(max(0, self.position.findData(self.app.state.window.startPosition)))
         self._last_startup_checked = is_startup_enabled()
         self.startup.setChecked(self._last_startup_checked)
+        self.edge_autohide.setChecked(settings.edgeAutoHide)
         self.calendar_enabled.setChecked(settings.calendarEnabled)
         self.calendar_url.setText(settings.calendarUrl)
         self.calendar_days.setValue(settings.calendarSyncDays)
         self.refresh_calendar_status()
         for widget, blocked in zip(
             [self.skin, self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup,
-             self.calendar_enabled, self.calendar_url, self.calendar_days],
+             self.edge_autohide, self.calendar_enabled, self.calendar_url, self.calendar_days],
             blockers,
         ):
             widget.blockSignals(blocked)
@@ -1274,6 +1291,7 @@ class SettingsWindow(QDialog):
         settings.fontColorMode = str(self.font_mode.currentData())
         settings.completeBehavior = str(self.complete.currentData())
         settings.layerMode = "alwaysVisibleClickThrough"
+        settings.edgeAutoHide = self.edge_autohide.isChecked()
         self.app.state.window.startPosition = str(self.position.currentData())
         if self.app.state.window.startPosition == "current":
             self.app.state.window.x = self.app.window.x()
@@ -1411,6 +1429,21 @@ class MemoWindow(OneGPUWidget):
         # click-through hit-testing that otherwise sends wheel events to the desktop below.
         self._wheel_hook = GlobalWheelHook(self._on_global_wheel)
         self._wheel_hook.install()
+
+        # ── Edge auto-hide (dock) state ──────────────────────────────────────────────────
+        self._dock_edge: str | None = None      # "left"/"right"/"top" while docked, else None
+        self._dock_hidden = False               # True when slid off-screen (only peek showing)
+        self._dock_animating = False            # suppresses moveEvent side effects during slide
+        self._dock_shown_pos: QPoint | None = None  # flush-against-edge position (fully visible)
+        self._slide_anim: QPropertyAnimation | None = None
+        # Cursor poll runs only while docked-and-shown: detects the cursor leaving the window so
+        # the hide countdown can start (the click-through body never delivers leave events).
+        self._dock_poll = QTimer(self)
+        self._dock_poll.setInterval(DOCK_POLL_MS)
+        self._dock_poll.timeout.connect(self._dock_tick)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._hide_docked)
 
     def schedule_contrast_refresh(self, delay: int = 180) -> None:
         if self.app.state.settings.skin == "acrylic" or self.app.state.settings.fontColorMode == "manual":
@@ -1609,16 +1642,35 @@ class MemoWindow(OneGPUWidget):
         self.protect_content_layer()
         for delay in (0, 80, 180, 420):
             QTimer.singleShot(delay, self.protect_content_layer)
+        # Re-showing (e.g. from the tray) while docked-hidden would otherwise reveal the window
+        # at its off-screen position — snap it back out so it is actually visible.
+        if self._dock_edge is not None and self._dock_hidden:
+            self._reveal_docked()
         if not self._shown_once:
             self._shown_once = True
             self.apply_initial_geometry()
             QTimer.singleShot(80, self.refresh)
             QTimer.singleShot(180, self.apply_text_colors)
+            # Restore a dock if the saved position sits against an edge.
+            QTimer.singleShot(280, self._maybe_dock)
         QTimer.singleShot(0, self.apply_settings)
+
+    def hideEvent(self, event) -> None:
+        # Suspend dock timers/animation while the window is hidden (e.g. from the tray); showEvent
+        # restores the dock. _dock_edge/_dock_hidden are kept so the state survives a hide/show.
+        self._dock_poll.stop()
+        self._hide_timer.stop()
+        self._cancel_slide()
+        self._dock_animating = False
+        super().hideEvent(event)
 
     def moveEvent(self, event) -> None:
         super().moveEvent(event)
         if self._shown_once:
+            # During a dock slide the window is mid-animation toward an off-screen position; skip
+            # the per-move capture/save/contrast work (and don't persist off-screen coordinates).
+            if self._dock_animating:
+                return
             self.app.state.window.x = self.x()
             self.app.state.window.y = self.y()
             if self._is_window_moving:
@@ -1639,12 +1691,21 @@ class MemoWindow(OneGPUWidget):
                 x = ctypes.c_short(msg.lParam & 0xFFFF).value
                 y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
                 local = self.mapFromGlobal(QPoint(x, y))
+                # While hidden, the on-screen peek strip must be HTCLIENT (not click-through) so
+                # the window receives WM_MOUSEMOVE over it and can slide back out.
+                if self._dock_hidden and not self._dock_animating and self._peek_rect_local().contains(local):
+                    return True, HTCLIENT
                 if self._rect_for(self.drag_handle).contains(local):
                     return True, HTCAPTION
                 if self._is_interactive_point(local):
                     return True, HTCLIENT
                 if self.app.state.settings.layerMode == "alwaysVisibleClickThrough":
                     return True, HTTRANSPARENT
+            if msg.message == WM_MOUSEMOVE:
+                # Only the peek strip is HTCLIENT while hidden, so any mouse-move here means the
+                # cursor reached the strip — slide the window back out.
+                if self._dock_hidden and not self._dock_animating:
+                    self._show_docked()
             if msg.message == WM_ENTERSIZEMOVE:
                 self._begin_window_move()
             elif msg.message == WM_EXITSIZEMOVE:
@@ -1693,6 +1754,7 @@ class MemoWindow(OneGPUWidget):
         self.app.save_later()
         if self._active_skin_kind == "acrylic":
             self.protect_content_layer()
+            self._maybe_dock()
             return
         self.sync_capture_position(render=True)
         self.protect_content_layer()
@@ -1700,6 +1762,207 @@ class MemoWindow(OneGPUWidget):
         if self.app.state.settings.fontColorMode != "manual":
             self._contrast_timer.start()
             self.schedule_contrast_refresh()
+        self._maybe_dock()
+
+    # ── Edge auto-hide (dock) ────────────────────────────────────────────────────────────
+    def _dock_geometry(self) -> QRect:
+        screen = self.screen() or QApplication.primaryScreen()
+        return screen.availableGeometry()
+
+    def _dock_pos(self, hidden: bool) -> QPoint:
+        """The window position for the current dock edge, either flush-visible or slid out to a
+        DOCK_PEEK strip. The cross-axis (position along the edge) comes from the snapped shown
+        position; the perpendicular axis is recomputed from the live window size."""
+        g = self._dock_geometry()
+        w, h = self.width(), self.height()
+        shown = self._dock_shown_pos or self.pos()
+        if self._dock_edge == "left":
+            x = (g.left() - w + DOCK_PEEK) if hidden else g.left()
+            return QPoint(x, shown.y())
+        if self._dock_edge == "right":
+            x = (g.left() + g.width() - DOCK_PEEK) if hidden else (g.left() + g.width() - w)
+            return QPoint(x, shown.y())
+        y = (g.top() - h + DOCK_PEEK) if hidden else g.top()  # "top"
+        return QPoint(shown.x(), y)
+
+    def _peek_rect_local(self) -> QRect:
+        w, h = self.width(), self.height()
+        if self._dock_edge == "left":
+            return QRect(w - DOCK_PEEK, 0, DOCK_PEEK, h)
+        if self._dock_edge == "right":
+            return QRect(0, 0, DOCK_PEEK, h)
+        if self._dock_edge == "top":
+            return QRect(0, h - DOCK_PEEK, w, DOCK_PEEK)
+        return QRect()
+
+    def _maybe_dock(self) -> None:
+        # Called after a move ends: dock to the nearest edge within threshold, else undock.
+        if not self.app.state.settings.edgeAutoHide or not self.isVisible():
+            self._undock()
+            return
+        g = self._dock_geometry()
+        x, y, w, h = self.x(), self.y(), self.width(), self.height()
+        gaps = {
+            "left": x - g.left(),
+            "right": (g.left() + g.width()) - (x + w),
+            "top": y - g.top(),
+        }
+        edge = min(gaps, key=gaps.get)
+        if gaps[edge] > DOCK_THRESHOLD:
+            self._undock()
+            return
+        self._dock_edge = edge
+        self._dock_hidden = False
+        if edge == "left":
+            shown = QPoint(g.left(), y)
+        elif edge == "right":
+            shown = QPoint(g.left() + g.width() - w, y)
+        else:
+            shown = QPoint(x, g.top())
+        self._dock_shown_pos = shown
+        if self.pos() != shown:
+            self.move(shown)
+        self._dock_shown_pos = self.pos()
+        self._hide_timer.stop()
+        self._dock_poll.start(DOCK_POLL_MS)
+
+    def _undock(self) -> None:
+        if self._dock_edge is None:
+            self._dock_hidden = False
+            return
+        if self._dock_hidden:
+            self._reveal_docked()  # never leave the window stranded off-screen
+        self._dock_edge = None
+        self._dock_hidden = False
+        self._dock_animating = False
+        self._dock_shown_pos = None
+        self._dock_poll.stop()
+        self._hide_timer.stop()
+        self._cancel_slide()
+        if self._active_skin_kind == "glass":
+            self.ensure_frame_loop(REST_FPS)
+
+    def _reposition_dock(self) -> None:
+        target = self._dock_pos(self._dock_hidden)
+        if self.pos() == target:
+            return
+        if self._dock_hidden:
+            self._dock_animating = True
+            self.move(target)
+            self._dock_animating = False
+        else:
+            self.move(target)
+            self._dock_shown_pos = self.pos()
+
+    def _reveal_docked(self) -> None:
+        # Instant (no slide) reveal to the flush position — used on tray re-show and undock.
+        self._cancel_slide()
+        self._dock_animating = True
+        self.move(self._dock_pos(hidden=False))
+        self._dock_animating = False
+        self._dock_hidden = False
+        if self._active_skin_kind == "glass":
+            self.ensure_frame_loop(REST_FPS)
+            self.sync_capture_position(render=True)
+        self.protect_content_layer()
+        if self._dock_edge is not None:
+            self._dock_poll.start(DOCK_POLL_MS)
+
+    def _hide_docked(self) -> None:
+        if self._dock_edge is None or self._dock_hidden or self._dock_animating:
+            return
+        if self._suppress_hide():
+            return
+        self._dock_hidden = True
+        self._hide_timer.stop()
+        # The poll keeps running while hidden: it is what detects the cursor reaching the peek
+        # strip. (WM_MOUSEMOVE on the strip proved unreliable in practice — the mostly off-screen
+        # HTCLIENT sliver does not dependably receive mouse messages.)
+        self._animate_to(self._dock_pos(hidden=True))
+
+    def _show_docked(self) -> None:
+        if self._dock_edge is None or not self._dock_hidden or self._dock_animating:
+            return
+        self._dock_hidden = False
+        if self._active_skin_kind == "glass":
+            self.ensure_frame_loop(REST_FPS)
+        self._animate_to(self._dock_pos(hidden=False))
+        self._dock_poll.start(DOCK_POLL_MS)
+
+    def _animate_to(self, target: QPoint) -> None:
+        self._cancel_slide()
+        if self.pos() == target:
+            self._on_slide_finished()
+            return
+        anim = QPropertyAnimation(self, b"pos", self)
+        anim.setDuration(DOCK_SLIDE_MS)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(self.pos())
+        anim.setEndValue(target)
+        anim.finished.connect(self._on_slide_finished)
+        self._dock_animating = True
+        self._slide_anim = anim
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def _cancel_slide(self) -> None:
+        if self._slide_anim is not None:
+            try:
+                self._slide_anim.stop()
+            except RuntimeError:
+                pass
+            self._slide_anim = None
+
+    def _on_slide_finished(self) -> None:
+        self._dock_animating = False
+        self._slide_anim = None
+        if self._active_skin_kind == "glass":
+            if self._dock_hidden:
+                self.stop()  # fully off-screen: stop the capture loop (saves power)
+            else:
+                self.refresh_capture_after_idle()
+                self.ensure_frame_loop(REST_FPS)
+                self.sync_capture_position(render=True)
+        self.protect_content_layer()
+
+    def _peek_rect_global(self) -> QRect:
+        # The on-screen strip of the hidden window, in global coordinates, with a small inward
+        # tolerance so the cursor doesn't have to land on the exact 5px sliver.
+        g = self._dock_geometry()
+        if self._dock_edge == "left":
+            return QRect(g.left(), self.y(), DOCK_PEEK + 2, self.height())
+        if self._dock_edge == "right":
+            return QRect(g.left() + g.width() - DOCK_PEEK - 2, self.y(), DOCK_PEEK + 2, self.height())
+        if self._dock_edge == "top":
+            return QRect(self.x(), g.top(), self.width(), DOCK_PEEK + 2)
+        return QRect()
+
+    def _dock_tick(self) -> None:
+        # Poll while docked. Shown: start the hide countdown when the cursor leaves the window.
+        # Hidden: watch for the cursor reaching the peek strip and slide back out.
+        if self._dock_edge is None or self._dock_animating:
+            return
+        cursor = QCursor.pos()
+        if self._dock_hidden:
+            if self._peek_rect_global().contains(cursor):
+                self._show_docked()
+            return
+        if self._suppress_hide():
+            self._hide_timer.stop()
+            return
+        inside = self.frameGeometry().adjusted(-3, -3, 3, 3).contains(cursor)
+        if inside:
+            self._hide_timer.stop()
+        elif not self._hide_timer.isActive():
+            self._hide_timer.start(DOCK_HIDE_DELAY_MS)
+
+    def _suppress_hide(self) -> bool:
+        return (
+            self._is_window_moving
+            or self.add_popup.isVisible()
+            or self.edit_ddl_popup.isVisible()
+            or self.app.settings_window.isVisible()
+            or self.app.history_window.isVisible()
+        )
 
     def apply_initial_geometry(self) -> None:
         self.refresh()
@@ -1732,6 +1995,8 @@ class MemoWindow(OneGPUWidget):
             self.refresh()
         self.protect_content_layer()
         self.apply_window_layer()
+        if not settings.edgeAutoHide:
+            self._undock()
 
     def _apply_glass_mode(self, reset_capture: bool = False) -> None:
         settings = self.app.state.settings
@@ -2122,6 +2387,10 @@ class MemoWindow(OneGPUWidget):
         self._keep_inside_screen(screen)
         self.app.state.window.width = width
         self.app.state.window.height = height
+        if self._dock_edge is not None:
+            # Content resized while docked: re-pin to the (recomputed) dock position so the peek
+            # strip and slide geometry stay correct for the new size.
+            self._reposition_dock()
 
     def _adaptive_width(self, active: list[TodoItem], events: list[CalendarEvent], screen: QRect, ddl_reserve: int = 0) -> int:
         if not active and not events:
@@ -2157,6 +2426,8 @@ class MemoWindow(OneGPUWidget):
     def _keep_inside_screen(self, screen: QRect) -> None:
         if not self.isVisible():
             return
+        if self._dock_edge is not None:
+            return  # docked positions intentionally sit at / past the screen edge
         margin = 12
         x = min(max(self.x(), screen.left() + margin), screen.right() - self.width() - margin)
         y = min(max(self.y(), screen.top() + margin), screen.bottom() - self.height() - margin)
