@@ -28,6 +28,7 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#AppExeName}
+SetupIconFile=..\assets\logo.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
