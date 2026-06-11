@@ -11,6 +11,10 @@ python -m PyInstaller `
   --noconsole `
   --name LiquidMemoWidget `
   --collect-all qfluentwidgets `
+  --collect-all icalendar `
+  --collect-all recurring_ical_events `
+  --collect-submodules dateutil `
+  --collect-data tzdata `
   --hidden-import numpy `
   --add-data "$root\LiquidMemoWidget;LiquidMemoWidget" `
   --add-data "$root\WindowsLiquidGlass;WindowsLiquidGlass" `

@@ -13,7 +13,19 @@ import numpy as np
 sys.dont_write_bytecode = True
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "0")
 
-from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QRect, QTimer, Qt, QPropertyAnimation, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QEasingCurve,
+    QObject,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    QRunnable,
+    Qt,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,10 +53,12 @@ from qfluentwidgets import (
     ColorDialog,
     ComboBox,
     FluentIcon,
+    LineEdit,
     PrimaryPushButton,
     PushButton,
     Slider,
     SmoothScrollArea,
+    SpinBox,
     SubtitleLabel,
     SwitchButton,
     TitleLabel,
@@ -65,7 +79,8 @@ from WindowsLiquidGlass.src.GPUSharderWidget.one_d3d_widget import (  # noqa: E4
 
 from liquid_effects import build_effect_params, color_overlay_strength
 from startup import is_startup_enabled, set_startup
-from state_store import AppState, Settings, StateStore, TodoItem, parse_ddl, utc_now
+from state_store import AppState, CalendarEvent, Settings, StateStore, TodoItem, parse_ddl, utc_now
+import calendar_sync
 from window_layer import (
     HTCAPTION,
     HTCLIENT,
@@ -110,6 +125,21 @@ DDL_NEAR_COLOR = "#FF9500"
 DDL_NEAR_WINDOW = timedelta(hours=24)
 # Placeholder shown in an empty (but visible) DDL cell, signalling it is click-to-set.
 DDL_EMPTY_HINT = "＋"
+# Calendar subscription ("日程" group).
+CALENDAR_HEADER_HEIGHT = 30
+CALENDAR_SYNC_INTERVAL_MS = 30 * 60 * 1000  # periodic background refresh
+_WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
+
+
+def format_event_time(event: "CalendarEvent") -> str:
+    """Compact local time shown in the calendar event's time column."""
+    deadline = parse_ddl(event.start)
+    if deadline is None:
+        return event.start
+    weekday = _WEEKDAY_CN[deadline.weekday()]
+    if event.allDay:
+        return f"{deadline.strftime('%m-%d')} 周{weekday} 全天"
+    return f"{deadline.strftime('%m-%d')} 周{weekday} {deadline.strftime('%H:%M')}"
 BUSY_BACKGROUND_ENTER = 0.36
 BUSY_BACKGROUND_EXIT = 0.26
 HIGH_VISIBILITY_COLORS = ["#39FF14", "#C800FF", "#00F5FF", "#FFF200"]
@@ -463,6 +493,131 @@ class TodoRow(QFrame):
 
     def _complete_changed(self) -> None:
         self.parent_window.complete_todo(self.todo.id, self.checkbox.isChecked(), self)
+
+
+class CalendarRow(QFrame):
+    """A read-only synced calendar event. Mirrors TodoRow's apply_text_style / apply_text_width
+    interface (and exposes .checkbox / .ddl_label) so the window's shared layout and contrast
+    loops can treat it like a todo row. No urgent button; the time cell is display-only."""
+
+    def __init__(self, event: CalendarEvent, done: bool, parent_window: "MemoWindow") -> None:
+        super().__init__(parent_window.content)
+        self.cal_event = event
+        self.done = done
+        self.parent_window = parent_window
+        self._style_signature: tuple[str, bool, bool, str] | None = None
+        self._halo: QGraphicsDropShadowEffect | None = None
+        self.setMinimumHeight(ROW_HEIGHT)
+        self.setObjectName("todoRow")
+        self.setStyleSheet(
+            f"""
+            QFrame#todoRow {{
+                {FONT_STACK_QSS}
+                background: transparent;
+                border-bottom: 1px solid rgba(255,255,255,72);
+            }}
+            QFrame#todoRow:hover {{ background: rgba(255,255,255,35); }}
+            """
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(10)
+
+        self.checkbox = QCheckBox()
+        self.checkbox.setCursor(Qt.PointingHandCursor)
+        self.checkbox.setChecked(done)
+        self.checkbox.setStyleSheet(
+            """
+            QCheckBox::indicator {
+                width: 18px; height: 18px; border-radius: 5px;
+                border: 1px solid rgba(25,35,45,120); background: rgba(255,255,255,80);
+            }
+            QCheckBox::indicator:hover { background: rgba(255,255,255,140); }
+            QCheckBox::indicator:checked { background: #111820; image: none; }
+            """
+        )
+        self.checkbox.stateChanged.connect(self._done_changed)
+        layout.addWidget(self.checkbox)
+
+        # A small glyph marks these rows as calendar events rather than user todos.
+        self.text = TodoTextLabel(f"📅 {event.summary}")
+        self.text.setFont(mixed_font(12))
+        self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        layout.addWidget(self.text, 1)
+
+        self.ddl_sep = QFrame()
+        self.ddl_sep.setObjectName("ddlSeparator")
+        self.ddl_sep.setFixedWidth(DDL_SEP_WIDTH)
+        self.ddl_sep.setStyleSheet("QFrame#ddlSeparator { background: rgba(25,35,45,110); border: none; }")
+        layout.addWidget(self.ddl_sep)
+
+        self.ddl_label = TodoTextLabel(format_event_time(event))
+        self.ddl_label.setFont(mixed_font(11))
+        self.ddl_label.setWordWrap(False)
+        self.ddl_label.setFixedWidth(DDL_COL_MIN)
+        self.ddl_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(self.ddl_label)
+
+        self.apply_text_style(parent_window._normal_text_color(), parent_window.text_needs_halo())
+
+    def _event_status(self) -> str:
+        if self.done:
+            return "none"
+        start = parse_ddl(self.cal_event.start)
+        if start is None:
+            return "normal"
+        now = datetime.now()
+        if start < now:
+            return "overdue"
+        if start - now <= DDL_NEAR_WINDOW:
+            return "near"
+        return "normal"
+
+    def apply_text_style(self, color: QColor, protect: bool) -> None:
+        status = self._event_status()
+        signature = (color.name(), self.done, protect, status)
+        if signature == self._style_signature:
+            return
+        self._style_signature = signature
+        alpha = 0.4 if self.done else 1.0
+        decoration = "text-decoration: line-through;" if self.done else ""
+        self.text.setStyleSheet(f"{FONT_STACK_QSS} font-size: 12pt; color: {css_rgba(color, alpha)}; {decoration}")
+        if status == "overdue":
+            time_css = f"color: {DDL_OVERDUE_COLOR}; font-weight: 600;"
+        elif status == "near":
+            time_css = f"color: {DDL_NEAR_COLOR}; font-weight: 600;"
+        else:
+            time_css = f"color: {css_rgba(color, alpha * 0.85)};"
+        self.ddl_label.setStyleSheet(f"{FONT_STACK_QSS} font-size: 11pt; {time_css} {decoration}")
+        if protect:
+            halo = self._halo
+            if halo is None:
+                halo = QGraphicsDropShadowEffect(self.text)
+                halo.setBlurRadius(3.2)
+                halo.setOffset(0, 0)
+                self._halo = halo
+                self.text.setGraphicsEffect(halo)
+            halo.setColor(QColor(0, 0, 0, 118) if relative_luminance(color) > 0.55 else QColor(255, 255, 255, 138))
+        elif self._halo is not None:
+            self._halo = None
+            self.text.setGraphicsEffect(None)
+
+    def apply_text_width(self, text_width: int, show_ddl: bool = True, ddl_width: int = DDL_COL_MIN) -> int:
+        text_width = max(90, text_width)
+        self.text.setFixedWidth(text_width)
+        self.ddl_label.setFixedWidth(ddl_width)
+        metrics = QFontMetrics(self.ddl_label.font())
+        self.ddl_label.setText(metrics.elidedText(format_event_time(self.cal_event), Qt.ElideRight, ddl_width))
+        text_metrics = QFontMetrics(self.text.font())
+        flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
+        rect = text_metrics.boundingRect(QRect(0, 0, text_width, 2000), flags, self.text.text())
+        height = max(ROW_HEIGHT, rect.height() + 18)
+        self.setFixedHeight(height)
+        return height
+
+    def _done_changed(self) -> None:
+        self.parent_window.toggle_calendar_event(self.cal_event.key, self.checkbox.isChecked())
 
 
 class AddTodoPopup(QDialog):
@@ -864,6 +1019,22 @@ class SettingsWindow(QDialog):
         self.startup = self._switch_row("开机自启动", "登录 Windows 后自动启动桌面备忘。", self._last_startup_checked)
         self.startup.checkedChanged.connect(lambda _checked: self._apply())
 
+        self._section("日历订阅")
+        self.calendar_enabled = self._switch_row(
+            "启用日历订阅", "开启后自动同步 ICS / webcal 日历链接中近 N 天的日程。", self.app.state.settings.calendarEnabled
+        )
+        self.calendar_enabled.checkedChanged.connect(lambda _checked: self._apply())
+        self.calendar_url = self._lineedit_row(
+            "订阅链接", "粘贴 Google / Outlook / Apple 的 ICS 或 webcal 日历地址。",
+            self.app.state.settings.calendarUrl, "https://… .ics 或 webcal://…",
+        )
+        self.calendar_url.editingFinished.connect(self._apply)
+        self.calendar_days = self._spinbox_row(
+            "同步未来天数", "只同步从今天起这么多天内的日程。", self.app.state.settings.calendarSyncDays, 1, 30
+        )
+        self.calendar_days.valueChanged.connect(lambda _value: self._apply())
+        self._calendar_status_row()
+
         self.form.addStretch()
 
     def _section(self, title: str) -> None:
@@ -939,6 +1110,64 @@ class SettingsWindow(QDialog):
         self.form.addWidget(FluentSettingRow(title, content, switch))
         return switch
 
+    def _lineedit_row(self, title: str, content: str, value: str, placeholder: str) -> LineEdit:
+        edit = LineEdit()
+        edit.setFixedWidth(300)
+        edit.setText(value)
+        edit.setPlaceholderText(placeholder)
+        edit.setClearButtonEnabled(True)
+        self.form.addWidget(FluentSettingRow(title, content, edit))
+        return edit
+
+    def _spinbox_row(self, title: str, content: str, value: int, minimum: int, maximum: int) -> SpinBox:
+        spin = SpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setValue(value)
+        spin.setFixedWidth(120)
+        self.form.addWidget(FluentSettingRow(title, content, spin))
+        return spin
+
+    def _calendar_status_row(self) -> None:
+        control = QWidget()
+        control.setFixedWidth(300)
+        layout = QHBoxLayout(control)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        self.calendar_status_label = BodyLabel("")
+        self.calendar_status_label.setWordWrap(True)
+        self.calendar_status_label.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,150); font-size: 12px;")
+        sync_button = PushButton("立即同步")
+        sync_button.clicked.connect(self._sync_calendar_now)
+        layout.addWidget(self.calendar_status_label, 1)
+        layout.addWidget(sync_button)
+        self.form.addWidget(FluentSettingRow("同步状态", "手动触发一次同步，或查看上次结果。", control))
+        self.refresh_calendar_status()
+
+    def _sync_calendar_now(self) -> None:
+        self._apply(save_now=True)
+        self.app.calendar.sync_now()
+
+    def refresh_calendar_status(self, syncing: bool = False) -> None:
+        if not hasattr(self, "calendar_status_label"):
+            return
+        state = self.app.state
+        if syncing:
+            text = "正在同步…"
+        elif state.calendarLastError:
+            text = f"同步失败：{state.calendarLastError}"
+        elif state.calendarLastSync:
+            text = f"上次同步 {self._format_local_time(state.calendarLastSync)}（{len(state.calendarEvents)} 条）"
+        else:
+            text = "尚未同步"
+        self.calendar_status_label.setText(text)
+
+    @staticmethod
+    def _format_local_time(iso_utc: str) -> str:
+        try:
+            return datetime.fromisoformat(iso_utc).astimezone().strftime("%m-%d %H:%M")
+        except (ValueError, TypeError):
+            return str(iso_utc)[:16]
+
     def _pick_color(self, control: QWidget, swatch: QFrame, button: PushButton, title: str) -> None:
         current = str(control.property("selectedColor") or "#F8FBFF")
         dialog = ColorDialog(QColor(current), title, self)
@@ -971,6 +1200,9 @@ class SettingsWindow(QDialog):
             self.complete.blockSignals(True),
             self.position.blockSignals(True),
             self.startup.blockSignals(True),
+            self.calendar_enabled.blockSignals(True),
+            self.calendar_url.blockSignals(True),
+            self.calendar_days.blockSignals(True),
         ]
         self.opacity.setValue(int(settings.glassOpacity * 100))
         self.opacity_value.setText(f"{self.opacity.value()}%")
@@ -984,8 +1216,13 @@ class SettingsWindow(QDialog):
         self.position.setCurrentIndex(max(0, self.position.findData(self.app.state.window.startPosition)))
         self._last_startup_checked = is_startup_enabled()
         self.startup.setChecked(self._last_startup_checked)
+        self.calendar_enabled.setChecked(settings.calendarEnabled)
+        self.calendar_url.setText(settings.calendarUrl)
+        self.calendar_days.setValue(settings.calendarSyncDays)
+        self.refresh_calendar_status()
         for widget, blocked in zip(
-            [self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup],
+            [self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup,
+             self.calendar_enabled, self.calendar_url, self.calendar_days],
             blockers,
         ):
             widget.blockSignals(blocked)
@@ -1006,6 +1243,7 @@ class SettingsWindow(QDialog):
         self._last_startup_checked = False
         self.sync_from_state()
         self._apply(save_now=True)
+        self.app.calendar.on_settings_changed()  # stop syncing + hide 日程 group on reset
         self.app.window.reset_capture_pipeline("reset-defaults")
 
     def _apply(self, *_args, save_now: bool = False) -> None:
@@ -1027,11 +1265,21 @@ class SettingsWindow(QDialog):
         if startup_checked != self._last_startup_checked:
             set_startup(startup_checked)
             self._last_startup_checked = startup_checked
+
+        # Calendar: detect a change so we only (re)sync when the subscription actually changes.
+        calendar_before = (settings.calendarEnabled, settings.calendarUrl, settings.calendarSyncDays)
+        settings.calendarEnabled = self.calendar_enabled.isChecked()
+        settings.calendarUrl = self.calendar_url.text().strip()
+        settings.calendarSyncDays = int(self.calendar_days.value())
+        calendar_changed = calendar_before != (settings.calendarEnabled, settings.calendarUrl, settings.calendarSyncDays)
+
         if save_now:
             self.app.save()
         else:
             self.app.save_later()
         self.app.window.apply_settings()
+        if calendar_changed:
+            self.app.calendar.on_settings_changed()
 
 
 class MemoWindow(OneGPUWidget):
@@ -1043,6 +1291,8 @@ class MemoWindow(OneGPUWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
         self._rows: dict[str, TodoRow] = {}
+        self._event_rows: dict[str, CalendarRow] = {}
+        self._calendar_header: QLabel | None = None
         self._shown_once = False
         self._sampled_background = QColor(246, 248, 252)
         self._background_complexity = 0.0
@@ -1300,7 +1550,11 @@ class MemoWindow(OneGPUWidget):
     def _is_interactive_point(self, point: QPoint) -> bool:
         widgets: list[QWidget] = [self.add_button, self.hide_button]
         for row in self._rows.values():
+            # ddl_label is the editable DDLCell (click-to-edit); the time cell on calendar rows
+            # is display-only, so only their checkbox is interactive.
             widgets.extend([row.checkbox, row.urgent, row.ddl_label])
+        for row in self._event_rows.values():
+            widgets.append(row.checkbox)
         return any(widget.isVisible() and self._rect_for(widget).adjusted(-4, -4, 4, 4).contains(point) for widget in widgets)
 
     def begin_system_move(self) -> None:
@@ -1411,26 +1665,64 @@ class MemoWindow(OneGPUWidget):
             if item.widget():
                 item.widget().deleteLater()
         self._rows.clear()
+        self._event_rows.clear()
+        self._calendar_header = None
 
         active = sorted(self.app.state.todos, key=self._todo_sort_key)
-        self.scroll.setVisible(bool(active))
-        self.empty.setVisible(not active)
+        events = self._visible_calendar_events()
+        self.scroll.setVisible(bool(active) or bool(events))
+        self.empty.setVisible(not active and not events)
 
         for todo in active:
             row = TodoRow(todo, self.app.state.settings, self)
             self._rows[todo.id] = row
             self.list_layout.addWidget(row)
+
+        if events:
+            self._calendar_header = self._make_calendar_header()
+            self.list_layout.addWidget(self._calendar_header)
+            done = set(self.app.state.calendarDoneKeys)
+            for event in events:
+                row = CalendarRow(event, event.key in done, self)
+                self._event_rows[event.key] = row
+                self.list_layout.addWidget(row)
+
         self.list_layout.addStretch()
-        self._resize_for_content(active)
+        self._resize_for_content(active, events)
         self.apply_text_colors()
 
-    def text_color_for(self, todo: TodoItem) -> QColor:
+    def _visible_calendar_events(self) -> list[CalendarEvent]:
         settings = self.app.state.settings
-        if todo.urgent:
-            return qcolor(settings.urgentTextColor, "#FF0000")
+        if not settings.calendarEnabled:
+            return []
+        events = list(self.app.state.calendarEvents)
+        if settings.completeBehavior == "archive":
+            done = set(self.app.state.calendarDoneKeys)
+            events = [event for event in events if event.key not in done]
+        return events
+
+    def _make_calendar_header(self) -> QLabel:
+        header = QLabel("日程")
+        header.setFixedHeight(CALENDAR_HEADER_HEIGHT)
+        color = self._normal_text_color()
+        header.setStyleSheet(
+            f"{FONT_STACK_QSS} color: {css_rgba(color, 0.7)}; font-size: 11pt; font-weight: 600; padding-left: 6px;"
+        )
+        return header
+
+    def toggle_calendar_event(self, key: str, checked: bool) -> None:
+        self.app.calendar.toggle_event_done(key, checked)
+
+    def _normal_text_color(self) -> QColor:
+        settings = self.app.state.settings
         if settings.fontColorMode == "manual":
             return qcolor(settings.todoTextColor)
         return QColor(self._auto_text_color)
+
+    def text_color_for(self, todo: TodoItem) -> QColor:
+        if todo.urgent:
+            return qcolor(self.app.state.settings.urgentTextColor, "#FF0000")
+        return self._normal_text_color()
 
     def text_needs_halo(self) -> bool:
         settings = self.app.state.settings
@@ -1441,10 +1733,14 @@ class MemoWindow(OneGPUWidget):
     def apply_text_colors(self) -> None:
         for row in self._rows.values():
             row.apply_text_style(self.text_color_for(row.todo), self.text_needs_halo())
-        if self.app.state.settings.fontColorMode == "manual":
-            empty_color = qcolor(self.app.state.settings.todoTextColor)
-        else:
-            empty_color = QColor(self._auto_text_color)
+        normal = self._normal_text_color()
+        for row in self._event_rows.values():
+            row.apply_text_style(normal, self.text_needs_halo())
+        if self._calendar_header is not None:
+            self._calendar_header.setStyleSheet(
+                f"{FONT_STACK_QSS} color: {css_rgba(normal, 0.7)}; font-size: 11pt; font-weight: 600; padding-left: 6px;"
+            )
+        empty_color = normal if self.app.state.settings.fontColorMode != "manual" else qcolor(self.app.state.settings.todoTextColor)
         self.empty.setStyleSheet(f"{FONT_STACK_QSS} color: {css_rgba(empty_color, 0.58)}; font-size: 15px;")
 
     def update_auto_contrast(self, force: bool = False) -> None:
@@ -1561,15 +1857,21 @@ class MemoWindow(OneGPUWidget):
         )
         return average, complexity
 
-    def _resize_for_content(self, active: list[TodoItem]) -> None:
+    def _resize_for_content(self, active: list[TodoItem], events: list[CalendarEvent] | None = None) -> None:
+        events = events or []
         screen = QApplication.primaryScreen().availableGeometry()
-        show_ddl = any(todo.ddl for todo in active)
-        ddl_width = self._ddl_column_width(active) if show_ddl else 0
-        ddl_reserve = (ddl_width + DDL_SEP_WIDTH + DDL_COL_GAPS) if show_ddl else 0
-        width = self._adaptive_width(active, screen, ddl_reserve)
+        show_todo_ddl = any(todo.ddl for todo in active)
+        # The time column is shared by todo DDLs and event times; show it (and reserve width)
+        # whenever either group needs it, sizing to the widest string across both for alignment.
+        column_active = show_todo_ddl or bool(events)
+        ddl_width = self._time_column_width(active, events) if column_active else 0
+        ddl_reserve = (ddl_width + DDL_SEP_WIDTH + DDL_COL_GAPS) if column_active else 0
+        width = self._adaptive_width(active, events, screen, ddl_reserve)
         text_width = self._text_width_for_window(width, ddl_reserve)
-        row_heights = [self._row_height_for(todo, text_width) for todo in active]
-        content_height = sum(row_heights) if row_heights else ROW_HEIGHT
+        content_height = sum(self._row_height_for(todo, text_width) for todo in active)
+        if events:
+            content_height += CALENDAR_HEADER_HEIGHT + ROW_HEIGHT * len(events)
+        content_height = max(content_height, ROW_HEIGHT)
         wanted = max(MIN_HEIGHT, 104 + content_height)
         height = min(wanted, int(screen.height() * MAX_HEIGHT_RATIO), screen.height() - 64)
 
@@ -1579,17 +1881,21 @@ class MemoWindow(OneGPUWidget):
                 self.container.setFixedSize(width, height)
 
         for row in self._rows.values():
-            row.apply_text_width(text_width, show_ddl, ddl_width)
+            row.apply_text_width(text_width, show_todo_ddl, ddl_width)
+        for row in self._event_rows.values():
+            row.apply_text_width(text_width, True, ddl_width)
 
         self._keep_inside_screen(screen)
         self.app.state.window.width = width
         self.app.state.window.height = height
 
-    def _adaptive_width(self, active: list[TodoItem], screen: QRect, ddl_reserve: int = 0) -> int:
-        if not active:
+    def _adaptive_width(self, active: list[TodoItem], events: list[CalendarEvent], screen: QRect, ddl_reserve: int = 0) -> int:
+        if not active and not events:
             return MIN_WIDTH
         metrics = QFontMetrics(mixed_font(12))
-        longest = max(metrics.horizontalAdvance(todo.text) for todo in active)
+        text_widths = [metrics.horizontalAdvance(todo.text) for todo in active]
+        text_widths += [metrics.horizontalAdvance(f"📅 {event.summary}") for event in events]
+        longest = max(text_widths) if text_widths else 0
         chrome = OUTER_X * 2 + 12 + 18 + 30 + 28 + 24 + ddl_reserve
         max_width = min(MAX_WIDTH, int(screen.width() * MAX_WIDTH_RATIO), screen.width() - 64)
         return max(MIN_WIDTH, min(max_width, longest + chrome))
@@ -1597,11 +1903,13 @@ class MemoWindow(OneGPUWidget):
     def _text_width_for_window(self, width: int, ddl_reserve: int = 0) -> int:
         return max(90, width - (OUTER_X * 2 + 12 + 18 + 30 + 28 + 12) - ddl_reserve)
 
-    def _ddl_column_width(self, active: list[TodoItem]) -> int:
-        # Width that fits the widest deadline text in this view (so dates show in full),
-        # clamped to [DDL_COL_MIN, DDL_COL_MAX]. Beyond MAX the row label still elides.
+    def _time_column_width(self, active: list[TodoItem], events: list[CalendarEvent]) -> int:
+        # Width that fits the widest deadline/event-time text in this view (so they show in
+        # full), clamped to [DDL_COL_MIN, DDL_COL_MAX]. Beyond MAX the cell still elides.
         metrics = QFontMetrics(mixed_font(11))
-        longest = max((metrics.horizontalAdvance(todo.ddl.strip()) for todo in active if todo.ddl.strip()), default=0)
+        candidates = [todo.ddl.strip() for todo in active if todo.ddl.strip()]
+        candidates += [format_event_time(event) for event in events]
+        longest = max((metrics.horizontalAdvance(text) for text in candidates), default=0)
         return max(DDL_COL_MIN, min(DDL_COL_MAX, longest + DDL_COL_PAD))
 
     def _row_height_for(self, todo: TodoItem, text_width: int) -> int:
@@ -1696,6 +2004,106 @@ class MemoWindow(OneGPUWidget):
         anim.start(QPropertyAnimation.DeleteWhenStopped)
 
 
+class _CalendarSyncSignals(QObject):
+    finished = Signal(list)  # list[CalendarEvent]
+    failed = Signal(str)
+
+
+class _CalendarSyncTask(QRunnable):
+    """Fetch + parse on a thread-pool thread so the glass render loop never blocks."""
+
+    def __init__(self, url: str, days: int, signals: _CalendarSyncSignals) -> None:
+        super().__init__()
+        self.url = url
+        self.days = days
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            text = calendar_sync.fetch_ics(self.url)
+            events = calendar_sync.parse_events(text, self.days, datetime.now())
+            self.signals.finished.emit(events)
+        except Exception as exc:  # network/parse errors are reported to the UI, not fatal
+            self.signals.failed.emit(str(exc) or exc.__class__.__name__)
+
+
+class CalendarManager:
+    """Owns calendar sync: periodic refresh, background fetch, and applying results to state."""
+
+    def __init__(self, app: "LiquidMemoApp") -> None:
+        self.app = app
+        self._running = False
+        self._signals: _CalendarSyncSignals | None = None
+        self._timer = QTimer()
+        self._timer.setInterval(CALENDAR_SYNC_INTERVAL_MS)
+        self._timer.timeout.connect(self.sync_now)
+        # Coalesces rapid settings edits (typing a URL, nudging the day spinbox) into one sync.
+        self._debounce = QTimer()
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(500)
+        self._debounce.timeout.connect(self.sync_now)
+
+    def start(self) -> None:
+        if self.app.state.settings.calendarEnabled:
+            self._timer.start()
+            self.sync_now()
+
+    def on_settings_changed(self) -> None:
+        settings = self.app.state.settings
+        if settings.calendarEnabled and settings.calendarUrl.strip():
+            if not self._timer.isActive():
+                self._timer.start()
+            self._debounce.start()
+        else:
+            self._timer.stop()
+            self._debounce.stop()
+            self.app.window.refresh()  # hide the 日程 group when disabled / no URL
+
+    def sync_now(self) -> None:
+        settings = self.app.state.settings
+        if not settings.calendarEnabled or not settings.calendarUrl.strip() or self._running:
+            return
+        self._running = True
+        self.app.settings_window.refresh_calendar_status(syncing=True)
+        signals = _CalendarSyncSignals()
+        signals.finished.connect(self._on_finished)
+        signals.failed.connect(self._on_failed)
+        self._signals = signals  # keep a reference alive until the task completes
+        task = _CalendarSyncTask(settings.calendarUrl, settings.calendarSyncDays, signals)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_finished(self, events: list[CalendarEvent]) -> None:
+        self._running = False
+        self.app.state.calendarEvents = events
+        self.app.state.calendarLastSync = utc_now()
+        self.app.state.calendarLastError = None
+        self._prune_done_keys()
+        self.app.save()
+        self.app.window.refresh()
+        self.app.settings_window.refresh_calendar_status()
+
+    def _on_failed(self, message: str) -> None:
+        self._running = False
+        self.app.state.calendarLastError = message
+        self.app.save_later()
+        self.app.settings_window.refresh_calendar_status()
+
+    def _prune_done_keys(self) -> None:
+        # Keep only keys still present in the freshly synced window; past, dropped occurrences
+        # fall out so the done set cannot grow without bound.
+        valid = {event.key for event in self.app.state.calendarEvents}
+        self.app.state.calendarDoneKeys = [key for key in self.app.state.calendarDoneKeys if key in valid]
+
+    def toggle_event_done(self, key: str, checked: bool) -> None:
+        keys = self.app.state.calendarDoneKeys
+        if checked and key not in keys:
+            keys.append(key)
+        elif not checked and key in keys:
+            keys.remove(key)
+        self.app.save()
+        self.app.window.refresh()
+
+
 class LiquidMemoApp:
     def __init__(self) -> None:
         self.qt = QApplication(sys.argv)
@@ -1711,6 +2119,7 @@ class LiquidMemoApp:
         self.window = MemoWindow(self)
         self.settings_window = SettingsWindow(self)
         self.history_window = HistoryWindow(self)
+        self.calendar = CalendarManager(self)
         self.tray_menu: QMenu | None = None
         self.tray = QSystemTrayIcon(tray_icon())
         self.tray.setToolTip("桌面备忘")
@@ -1722,6 +2131,8 @@ class LiquidMemoApp:
         # showEvent already drives the initial geometry/refresh/recolor sequence; scheduling
         # it again here only rebuilt the list and recolored it a second time.
         self.window.show()
+        # Kick off the first calendar sync once the event loop is about to run.
+        QTimer.singleShot(0, self.calendar.start)
         return self.qt.exec()
 
     def save_later(self) -> None:
