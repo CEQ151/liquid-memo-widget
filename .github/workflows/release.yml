@@ -38,6 +38,14 @@ jobs:
           "APP_VERSION=$appVersion" | Out-File -FilePath $env:GITHUB_ENV -Append
           "Resolved release version: $version"
 
+      - name: Stamp app version
+        shell: pwsh
+        run: |
+          $versionFile = "LiquidMemoWidget\version.py"
+          (Get-Content $versionFile) -replace 'APP_VERSION = ".*"', "APP_VERSION = `"$env:APP_VERSION`"" |
+            Set-Content $versionFile
+          Get-Content $versionFile | Select-String "APP_VERSION"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -87,6 +95,9 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
           name: Liquid Memo Widget ${{ env.RELEASE_VERSION }}
+          # Appends an auto-generated changelog (merged PRs / commits) to the body;
+          # the in-app update dialog and post-update changelog render this text.
+          generate_release_notes: true
           body: |
             ## Liquid Memo Widget ${{ env.RELEASE_VERSION }}
 

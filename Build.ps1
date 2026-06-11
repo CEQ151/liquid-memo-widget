@@ -16,6 +16,8 @@ python -m PyInstaller `
   --collect-submodules dateutil `
   --collect-data tzdata `
   --hidden-import numpy `
+  --icon "$root\assets\logo.ico" `
+  --add-data "$root\assets\logo.ico;assets" `
   --add-data "$root\LiquidMemoWidget;LiquidMemoWidget" `
   --add-data "$root\WindowsLiquidGlass;WindowsLiquidGlass" `
   (Join-Path $root "RunLiquidMemoWidget.pyw")

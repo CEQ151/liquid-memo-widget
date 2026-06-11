@@ -127,6 +127,9 @@ class Settings:
     calendarEnabled: bool = False
     calendarUrl: str = ""
     calendarSyncDays: int = 7
+    # Version of the app on its previous run; when it differs from the current
+    # APP_VERSION the app shows the new version's changelog once after an update.
+    lastRunVersion: str = ""
 
 
 @dataclass
