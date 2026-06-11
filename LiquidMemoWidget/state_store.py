@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 
-APP_DIR = Path.home() / "AppData" / "Roaming" / "DesktopMemoWidget"
+APP_DIR = Path.home() / "AppData" / "Roaming" / "DesktopMemo_Pro"
 STATE_PATH = APP_DIR / "liquid-state.json"
 
 
@@ -17,10 +18,62 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# DDL is stored as free text (e.g. "6-15 23:59", "2026/6/15", "6月15日"). For sorting and
+# overdue/near highlighting we make a best-effort parse of common machine-readable forms into
+# a naive local datetime; anything we cannot parse (e.g. "下周一") returns None and is excluded
+# from date-based sorting/highlighting while still displaying its text verbatim.
+_DDL_PATTERNS = [
+    # YYYY-MM-DD or YYYY/MM/DD, optional HH:MM
+    re.compile(r"^(?P<y>\d{4})[-/.](?P<mo>\d{1,2})[-/.](?P<d>\d{1,2})(?:\s+(?P<h>\d{1,2}):(?P<mi>\d{2}))?$"),
+    # MM-DD or M/D (no year), optional HH:MM
+    re.compile(r"^(?P<mo>\d{1,2})[-/.](?P<d>\d{1,2})(?:\s+(?P<h>\d{1,2}):(?P<mi>\d{2}))?$"),
+    # Chinese: YYYY年M月D日 / M月D日, optional H[点时]M?分
+    re.compile(
+        r"^(?:(?P<y>\d{4})年)?(?P<mo>\d{1,2})月(?P<d>\d{1,2})日?"
+        r"(?:\s*(?P<h>\d{1,2})[点时](?:(?P<mi>\d{1,2})分?)?)?$"
+    ),
+]
+
+
+def parse_ddl(text: str, now: datetime | None = None) -> datetime | None:
+    """Best-effort parse of a DDL string into a naive local datetime, or None.
+
+    Year-less inputs assume the current year; if that places the deadline more than ~180 days
+    in the past it rolls to next year (so "1-5" entered in December means next January).
+    A missing time defaults to 23:59 (end of day), matching common deadline semantics.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    now = now or datetime.now()
+    for pattern in _DDL_PATTERNS:
+        match = pattern.match(text)
+        if not match:
+            continue
+        parts = match.groupdict()
+        try:
+            month = int(parts["mo"])
+            day = int(parts["d"])
+            year = int(parts["y"]) if parts.get("y") else now.year
+            hour = int(parts["h"]) if parts.get("h") else 23
+            minute = int(parts["mi"]) if parts.get("mi") else (0 if parts.get("h") else 59)
+            candidate = datetime(year, month, day, hour, minute)
+        except (ValueError, TypeError):
+            return None
+        if not parts.get("y") and (now - candidate).days > 180:
+            try:
+                candidate = candidate.replace(year=year + 1)
+            except ValueError:
+                pass
+        return candidate
+    return None
+
+
 @dataclass
 class TodoItem:
     id: str = field(default_factory=lambda: str(uuid4()))
     text: str = ""
+    ddl: str = ""
     urgent: bool = False
     done: bool = False
     createdAt: str = field(default_factory=utc_now)
@@ -32,6 +85,7 @@ class TodoItem:
         return TodoItem(
             id=str(data.get("id") or uuid4()),
             text=str(data.get("text") or ""),
+            ddl=str(data.get("ddl") or ""),
             urgent=bool(data.get("urgent", False)),
             done=bool(data.get("done", False)),
             createdAt=str(data.get("createdAt") or utc_now()),
@@ -52,6 +106,10 @@ class WindowState:
 
 @dataclass
 class Settings:
+    # Rendering skin. "acrylic" is a lightweight DWM frosted-glass surface (no GPU screen
+    # capture) for low-end PCs and is the default; "glass" is the original real-time D3D
+    # liquid-glass refraction. Any other value normalizes to "acrylic" in from_dict.
+    skin: str = "acrylic"
     glassOpacity: float = 0.0
     liquidStrength: float = 1.0
     windowTint: str = "#FFFFFF"
@@ -61,15 +119,51 @@ class Settings:
     completeBehavior: str = "archive"
     layerMode: str = "alwaysVisibleClickThrough"
     startWithWindows: bool = False
+    # When True, dragging the window to a screen edge docks it and it auto-hides off-screen
+    # (leaving a thin peek strip) until the cursor returns to that strip.
+    edgeAutoHide: bool = True
+    # Calendar subscription: when enabled, the widget syncs the next `calendarSyncDays` days of
+    # events from an ICS/webcal URL and shows them in a separate "日程" group.
+    calendarEnabled: bool = False
+    calendarUrl: str = ""
+    calendarSyncDays: int = 7
+
+
+@dataclass
+class CalendarEvent:
+    uid: str = ""
+    summary: str = ""
+    start: str = ""  # ISO local datetime (or date for all-day)
+    allDay: bool = False
+    # Stable identity for one occurrence (a recurring series yields one key per instance), used
+    # to remember which events the user checked off across re-syncs.
+    key: str = ""
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "CalendarEvent":
+        uid = str(data.get("uid") or "")
+        start = str(data.get("start") or "")
+        return CalendarEvent(
+            uid=uid,
+            summary=str(data.get("summary") or ""),
+            start=start,
+            allDay=bool(data.get("allDay", False)),
+            key=str(data.get("key") or f"{uid}|{start}"),
+        )
 
 
 @dataclass
 class AppState:
-    version: int = 2
+    version: int = 3
     settings: Settings = field(default_factory=Settings)
     window: WindowState = field(default_factory=WindowState)
     todos: list[TodoItem] = field(default_factory=list)
     history: list[TodoItem] = field(default_factory=list)
+    # Calendar cache + state, all persisted so a relaunch shows last-synced events offline.
+    calendarEvents: list[CalendarEvent] = field(default_factory=list)
+    calendarDoneKeys: list[str] = field(default_factory=list)
+    calendarLastSync: str | None = None
+    calendarLastError: str | None = None
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "AppState":
@@ -80,10 +174,25 @@ class AppState:
         settings = Settings(**{key: settings_data.get(key, value) for key, value in settings_defaults.items()})
         if settings.layerMode != "alwaysVisibleClickThrough":
             settings.layerMode = "alwaysVisibleClickThrough"
+        if settings.skin not in ("acrylic", "glass"):
+            settings.skin = "acrylic"
+        settings.calendarSyncDays = max(1, min(30, int(settings.calendarSyncDays or 7)))
         window = WindowState(**{key: window_data.get(key, value) for key, value in window_defaults.items()})
         todos = [TodoItem.from_dict(item) for item in data.get("todos") or []]
         history = [TodoItem.from_dict(item) for item in data.get("history") or []]
-        return AppState(version=2, settings=settings, window=window, todos=todos, history=history)
+        events = [CalendarEvent.from_dict(item) for item in data.get("calendarEvents") or []]
+        done_keys = [str(key) for key in data.get("calendarDoneKeys") or []]
+        return AppState(
+            version=3,
+            settings=settings,
+            window=window,
+            todos=todos,
+            history=history,
+            calendarEvents=events,
+            calendarDoneKeys=done_keys,
+            calendarLastSync=data.get("calendarLastSync"),
+            calendarLastError=data.get("calendarLastError"),
+        )
 
 
 class StateStore:

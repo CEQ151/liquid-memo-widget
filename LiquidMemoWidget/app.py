@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -12,7 +14,19 @@ import numpy as np
 sys.dont_write_bytecode = True
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "0")
 
-from PySide6.QtCore import QEvent, QEasingCurve, QPoint, QRect, QTimer, Qt, QPropertyAnimation
+from PySide6.QtCore import (
+    QEvent,
+    QEasingCurve,
+    QObject,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    QRunnable,
+    Qt,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,10 +54,12 @@ from qfluentwidgets import (
     ColorDialog,
     ComboBox,
     FluentIcon,
+    LineEdit,
     PrimaryPushButton,
     PushButton,
     Slider,
     SmoothScrollArea,
+    SpinBox,
     SubtitleLabel,
     SwitchButton,
     TitleLabel,
@@ -64,7 +80,9 @@ from WindowsLiquidGlass.src.GPUSharderWidget.one_d3d_widget import (  # noqa: E4
 
 from liquid_effects import build_effect_params, color_overlay_strength
 from startup import is_startup_enabled, set_startup
-from state_store import AppState, Settings, StateStore, TodoItem, utc_now
+from state_store import AppState, CalendarEvent, Settings, StateStore, TodoItem, parse_ddl, utc_now
+import calendar_sync
+from wheel_hook import GlobalWheelHook
 from window_layer import (
     HTCAPTION,
     HTCLIENT,
@@ -75,8 +93,10 @@ from window_layer import (
     apply_tool_window,
     begin_system_move,
     detach_from_parent,
+    set_rounded_corners,
     set_topmost,
 )
+from qframelesswindow.windows.window_effect import WindowsWindowEffect
 
 
 CJK_FONT = "Microsoft YaHei"
@@ -90,6 +110,41 @@ MIN_HEIGHT = 320
 MAX_HEIGHT_RATIO = 0.7
 ROW_HEIGHT = 44
 OUTER_X = 26
+# DDL column: a fixed-width deadline column shown to the right of each todo's text,
+# separated from it by a solid vertical line. Width is only reserved from the text
+# column when at least one active todo actually carries a ddl.
+# DDL column width is adaptive: sized to fit the widest deadline text in the current view so
+# dates always show in full, clamped to [MIN, MAX] so a single long string can't blow up the
+# window (anything past MAX still elides).
+DDL_COL_MIN = 64
+DDL_COL_MAX = 240
+DDL_COL_EXPANDED_MAX = 600  # in expanded mode the time column may grow to avoid any elision
+DDL_COL_PAD = 6
+DDL_SEP_WIDTH = 1
+# Two extra HBox gaps (text↔separator and separator↔ddl) at the layout's 10px spacing.
+DDL_COL_GAPS = 20
+# Deadline highlighting: a parsed DDL already past "now" turns red; one due within
+# DDL_NEAR_WINDOW turns amber. Unparseable or done items follow the normal text color.
+DDL_OVERDUE_COLOR = "#FF3B30"
+DDL_NEAR_COLOR = "#FF9500"
+DDL_NEAR_WINDOW = timedelta(hours=24)
+# Placeholder shown in an empty (but visible) DDL cell, signalling it is click-to-set.
+DDL_EMPTY_HINT = "＋"
+# Calendar subscription ("日程" group).
+CALENDAR_HEADER_HEIGHT = 30
+CALENDAR_SYNC_INTERVAL_MS = 30 * 60 * 1000  # periodic background refresh
+_WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
+
+
+def format_event_time(event: "CalendarEvent") -> str:
+    """Compact local time shown in the calendar event's time column."""
+    deadline = parse_ddl(event.start)
+    if deadline is None:
+        return event.start
+    weekday = _WEEKDAY_CN[deadline.weekday()]
+    if event.allDay:
+        return f"{deadline.strftime('%m-%d')} 周{weekday} 全天"
+    return f"{deadline.strftime('%m-%d')} 周{weekday} {deadline.strftime('%H:%M')}"
 BUSY_BACKGROUND_ENTER = 0.36
 BUSY_BACKGROUND_EXIT = 0.26
 HIGH_VISIBILITY_COLORS = ["#39FF14", "#C800FF", "#00F5FF", "#FFF200"]
@@ -99,6 +154,16 @@ _SAMPLE_DIM = 44
 # for the per-frame blank-frame validation readback.
 REST_FPS = 20
 MOVE_FPS = 30
+
+# Edge auto-hide ("dock"): when the window is dragged within DOCK_THRESHOLD px of a work-area
+# edge (left/right/top) it snaps flush and, once the cursor leaves, slides off-screen leaving a
+# DOCK_PEEK-px strip. Moving the cursor back onto that strip slides it out again.
+WM_MOUSEMOVE = 0x0200
+DOCK_THRESHOLD = 18
+DOCK_PEEK = 5
+DOCK_HIDE_DELAY_MS = 600
+DOCK_SLIDE_MS = 200
+DOCK_POLL_MS = 120
 
 
 def _dwm_flush() -> None:
@@ -230,6 +295,25 @@ class TodoTextLabel(QLabel):
         self.setText(text)
 
 
+class DDLCell(TodoTextLabel):
+    """Deadline column label. Emits `clicked` so its row can open the DDL editor; the row also
+    registers it with the native hit-test so the click lands here instead of passing through."""
+
+    clicked = Signal()
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setWordWrap(False)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class DragHandle(QLabel):
     def __init__(self, parent_window: "MemoWindow") -> None:
         super().__init__("⋮⋮", parent_window.content)
@@ -263,7 +347,7 @@ class TodoRow(QFrame):
         super().__init__(parent_window.content)
         self.todo = todo
         self.parent_window = parent_window
-        self._style_signature: tuple[str, bool, bool] | None = None
+        self._style_signature: tuple[str, bool, bool, str] | None = None
         self._halo: QGraphicsDropShadowEffect | None = None
         self.setMinimumHeight(ROW_HEIGHT)
         self.setObjectName("todoRow")
@@ -307,8 +391,28 @@ class TodoRow(QFrame):
         self.text = TodoTextLabel(todo.text)
         self.text.setFont(mixed_font(12))
         self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.apply_text_style(parent_window.text_color_for(todo), parent_window.text_needs_halo())
         layout.addWidget(self.text, 1)
+
+        # DDL column: solid vertical separator + deadline label. Both stay hidden until the
+        # layout pass (apply_text_width) decides the column should be shown for this view.
+        self.ddl_sep = QFrame()
+        self.ddl_sep.setObjectName("ddlSeparator")
+        self.ddl_sep.setFixedWidth(DDL_SEP_WIDTH)
+        self.ddl_sep.setStyleSheet("QFrame#ddlSeparator { background: rgba(25,35,45,110); border: none; }")
+        self.ddl_sep.setVisible(False)
+        layout.addWidget(self.ddl_sep)
+
+        self.ddl_label = DDLCell(todo.ddl)
+        self.ddl_label.setFont(mixed_font(11))
+        self.ddl_label.setFixedWidth(DDL_COL_MIN)  # adaptive width set in apply_text_width
+        self.ddl_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.ddl_label.setToolTip(todo.ddl or "点击设置截止时间")
+        self.ddl_label.setVisible(False)
+        self.ddl_label.clicked.connect(lambda: parent_window.edit_ddl(todo.id))
+        layout.addWidget(self.ddl_label)
+
+        # Style text + ddl together, now that both labels exist.
+        self.apply_text_style(parent_window.text_color_for(todo), parent_window.text_needs_halo())
 
         self.urgent = QPushButton("❗")
         self.urgent.setFixedSize(30, 30)
@@ -329,18 +433,43 @@ class TodoRow(QFrame):
         self.urgent.clicked.connect(lambda: parent_window.toggle_urgent(todo.id))
         layout.addWidget(self.urgent)
 
+    def _ddl_status(self) -> str:
+        # "overdue"/"near"/"normal"/"none" — drives the deadline color. Done items and
+        # cells whose text we cannot parse into a date never get the alert colors.
+        if self.todo.done or not self.todo.ddl.strip():
+            return "none"
+        deadline = parse_ddl(self.todo.ddl)
+        if deadline is None:
+            return "normal"
+        now = datetime.now()
+        if deadline < now:
+            return "overdue"
+        if deadline - now <= DDL_NEAR_WINDOW:
+            return "near"
+        return "normal"
+
     def apply_text_style(self, color: QColor, protect: bool) -> None:
         # Re-applying an identical style (and especially swapping in a brand-new
         # QGraphicsDropShadowEffect) forces a repaint of the row; with the contrast timer
         # firing every few hundred ms that reads as text flicker. Skip no-op updates and
         # reuse the existing halo effect.
-        signature = (color.name(), self.todo.done, protect)
+        ddl_status = self._ddl_status()
+        signature = (color.name(), self.todo.done, protect, ddl_status)
         if signature == self._style_signature:
             return
         self._style_signature = signature
         alpha = 0.45 if self.todo.done else 1.0
         decoration = "text-decoration: line-through;" if self.todo.done else ""
         self.text.setStyleSheet(f"{FONT_STACK_QSS} font-size: 12pt; color: {css_rgba(color, alpha)}; {decoration}")
+        if ddl_status == "overdue":
+            ddl_css = f"color: {DDL_OVERDUE_COLOR}; font-weight: 600;"
+        elif ddl_status == "near":
+            ddl_css = f"color: {DDL_NEAR_COLOR}; font-weight: 600;"
+        elif self.todo.ddl.strip():
+            ddl_css = f"color: {css_rgba(color, alpha * 0.85)};"
+        else:
+            ddl_css = f"color: {css_rgba(color, alpha * 0.4)};"  # faint click-to-set hint
+        self.ddl_label.setStyleSheet(f"{FONT_STACK_QSS} font-size: 11pt; {ddl_css} {decoration}")
         if protect:
             halo = self._halo
             if halo is None:
@@ -357,9 +486,19 @@ class TodoRow(QFrame):
             self._halo = None
             self.text.setGraphicsEffect(None)
 
-    def apply_text_width(self, text_width: int) -> int:
+    def apply_text_width(self, text_width: int, show_ddl: bool = False, ddl_width: int = DDL_COL_MIN) -> int:
         text_width = max(90, text_width)
         self.text.setFixedWidth(text_width)
+        self.ddl_sep.setVisible(show_ddl)
+        self.ddl_label.setVisible(show_ddl)
+        if show_ddl:
+            self.ddl_label.setFixedWidth(ddl_width)
+            raw = self.todo.ddl.strip()
+            if raw:
+                ddl_metrics = QFontMetrics(self.ddl_label.font())
+                self.ddl_label.setText(ddl_metrics.elidedText(raw, Qt.ElideRight, ddl_width))
+            else:
+                self.ddl_label.setText(DDL_EMPTY_HINT)
         metrics = QFontMetrics(self.text.font())
         flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
         rect = metrics.boundingRect(QRect(0, 0, text_width, 2000), flags, self.todo.text)
@@ -369,6 +508,131 @@ class TodoRow(QFrame):
 
     def _complete_changed(self) -> None:
         self.parent_window.complete_todo(self.todo.id, self.checkbox.isChecked(), self)
+
+
+class CalendarRow(QFrame):
+    """A read-only synced calendar event. Mirrors TodoRow's apply_text_style / apply_text_width
+    interface (and exposes .checkbox / .ddl_label) so the window's shared layout and contrast
+    loops can treat it like a todo row. No urgent button; the time cell is display-only."""
+
+    def __init__(self, event: CalendarEvent, done: bool, parent_window: "MemoWindow") -> None:
+        super().__init__(parent_window.content)
+        self.cal_event = event
+        self.done = done
+        self.parent_window = parent_window
+        self._style_signature: tuple[str, bool, bool, str] | None = None
+        self._halo: QGraphicsDropShadowEffect | None = None
+        self.setMinimumHeight(ROW_HEIGHT)
+        self.setObjectName("todoRow")
+        self.setStyleSheet(
+            f"""
+            QFrame#todoRow {{
+                {FONT_STACK_QSS}
+                background: transparent;
+                border-bottom: 1px solid rgba(255,255,255,72);
+            }}
+            QFrame#todoRow:hover {{ background: rgba(255,255,255,35); }}
+            """
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(10)
+
+        self.checkbox = QCheckBox()
+        self.checkbox.setCursor(Qt.PointingHandCursor)
+        self.checkbox.setChecked(done)
+        self.checkbox.setStyleSheet(
+            """
+            QCheckBox::indicator {
+                width: 18px; height: 18px; border-radius: 5px;
+                border: 1px solid rgba(25,35,45,120); background: rgba(255,255,255,80);
+            }
+            QCheckBox::indicator:hover { background: rgba(255,255,255,140); }
+            QCheckBox::indicator:checked { background: #111820; image: none; }
+            """
+        )
+        self.checkbox.stateChanged.connect(self._done_changed)
+        layout.addWidget(self.checkbox)
+
+        # A small glyph marks these rows as calendar events rather than user todos.
+        self.text = TodoTextLabel(f"📅 {event.summary}")
+        self.text.setFont(mixed_font(12))
+        self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        layout.addWidget(self.text, 1)
+
+        self.ddl_sep = QFrame()
+        self.ddl_sep.setObjectName("ddlSeparator")
+        self.ddl_sep.setFixedWidth(DDL_SEP_WIDTH)
+        self.ddl_sep.setStyleSheet("QFrame#ddlSeparator { background: rgba(25,35,45,110); border: none; }")
+        layout.addWidget(self.ddl_sep)
+
+        self.ddl_label = TodoTextLabel(format_event_time(event))
+        self.ddl_label.setFont(mixed_font(11))
+        self.ddl_label.setWordWrap(False)
+        self.ddl_label.setFixedWidth(DDL_COL_MIN)
+        self.ddl_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(self.ddl_label)
+
+        self.apply_text_style(parent_window._normal_text_color(), parent_window.text_needs_halo())
+
+    def _event_status(self) -> str:
+        if self.done:
+            return "none"
+        start = parse_ddl(self.cal_event.start)
+        if start is None:
+            return "normal"
+        now = datetime.now()
+        if start < now:
+            return "overdue"
+        if start - now <= DDL_NEAR_WINDOW:
+            return "near"
+        return "normal"
+
+    def apply_text_style(self, color: QColor, protect: bool) -> None:
+        status = self._event_status()
+        signature = (color.name(), self.done, protect, status)
+        if signature == self._style_signature:
+            return
+        self._style_signature = signature
+        alpha = 0.4 if self.done else 1.0
+        decoration = "text-decoration: line-through;" if self.done else ""
+        self.text.setStyleSheet(f"{FONT_STACK_QSS} font-size: 12pt; color: {css_rgba(color, alpha)}; {decoration}")
+        if status == "overdue":
+            time_css = f"color: {DDL_OVERDUE_COLOR}; font-weight: 600;"
+        elif status == "near":
+            time_css = f"color: {DDL_NEAR_COLOR}; font-weight: 600;"
+        else:
+            time_css = f"color: {css_rgba(color, alpha * 0.85)};"
+        self.ddl_label.setStyleSheet(f"{FONT_STACK_QSS} font-size: 11pt; {time_css} {decoration}")
+        if protect:
+            halo = self._halo
+            if halo is None:
+                halo = QGraphicsDropShadowEffect(self.text)
+                halo.setBlurRadius(3.2)
+                halo.setOffset(0, 0)
+                self._halo = halo
+                self.text.setGraphicsEffect(halo)
+            halo.setColor(QColor(0, 0, 0, 118) if relative_luminance(color) > 0.55 else QColor(255, 255, 255, 138))
+        elif self._halo is not None:
+            self._halo = None
+            self.text.setGraphicsEffect(None)
+
+    def apply_text_width(self, text_width: int, show_ddl: bool = True, ddl_width: int = DDL_COL_MIN) -> int:
+        text_width = max(90, text_width)
+        self.text.setFixedWidth(text_width)
+        self.ddl_label.setFixedWidth(ddl_width)
+        metrics = QFontMetrics(self.ddl_label.font())
+        self.ddl_label.setText(metrics.elidedText(format_event_time(self.cal_event), Qt.ElideRight, ddl_width))
+        text_metrics = QFontMetrics(self.text.font())
+        flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
+        rect = text_metrics.boundingRect(QRect(0, 0, text_width, 2000), flags, self.text.text())
+        height = max(ROW_HEIGHT, rect.height() + 18)
+        self.setFixedHeight(height)
+        return height
+
+    def _done_changed(self) -> None:
+        self.parent_window.toggle_calendar_event(self.cal_event.key, self.checkbox.isChecked())
 
 
 class AddTodoPopup(QDialog):
@@ -415,6 +679,11 @@ class AddTodoPopup(QDialog):
         self.input.setPlaceholderText("输入事项")
         self.input.returnPressed.connect(self.accept)
         layout.addWidget(self.input, 1)
+        self.ddl_input = QLineEdit()
+        self.ddl_input.setPlaceholderText("DDL（可选）")
+        self.ddl_input.setFixedWidth(124)
+        self.ddl_input.returnPressed.connect(self.accept)
+        layout.addWidget(self.ddl_input)
         self.ok = RoundButton("✓", 42, tone="confirm")
         self.ok.clicked.connect(self.accept)
         layout.addWidget(self.ok)
@@ -425,6 +694,7 @@ class AddTodoPopup(QDialog):
         self.panel.setGeometry(0, 0, self.width(), self.height())
         self.move(point)
         self.input.clear()
+        self.ddl_input.clear()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -444,7 +714,83 @@ class AddTodoPopup(QDialog):
     def accept(self) -> None:
         text = self.input.text().strip()
         if text:
-            self.parent_window.add_todo(text)
+            self.parent_window.add_todo(text, self.ddl_input.text().strip())
+        self.hide()
+
+
+class EditDDLPopup(QDialog):
+    """Single-field popup to set/clear the deadline of an existing todo. Mirrors AddTodoPopup's
+    Qt.Tool + click-outside-to-dismiss behavior; the editing target is remembered per open."""
+
+    def __init__(self, parent_window: "MemoWindow") -> None:
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.parent_window = parent_window
+        self._todo_id: str | None = None
+        self.setWindowTitle("设置截止时间")
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFixedSize(320, 74)
+
+        self.panel = QFrame(self)
+        self.panel.setObjectName("addPanel")
+        self.panel.setGeometry(0, 0, self.width(), self.height())
+        self.panel.setStyleSheet(
+            f"""
+            QFrame#addPanel {{
+                {FONT_STACK_QSS}
+                border-radius: 22px;
+                border: 1px solid rgba(255,255,255,170);
+                background: rgba(248,252,255,238);
+            }}
+            QLineEdit {{
+                {FONT_STACK_QSS}
+                border: 1px solid rgba(255,255,255,145);
+                border-radius: 17px;
+                background: rgba(255,255,255,150);
+                color: #111820;
+                font-size: 15px;
+                padding: 7px 12px;
+                selection-background-color: rgba(33,150,243,120);
+            }}
+            """
+        )
+        add_soft_shadow(self.panel, blur=22, y=8, alpha=60)
+
+        layout = QHBoxLayout(self.panel)
+        layout.setContentsMargins(18, 12, 12, 12)
+        layout.setSpacing(10)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("DDL（留空清除）")
+        self.input.returnPressed.connect(self.accept)
+        layout.addWidget(self.input, 1)
+        self.ok = RoundButton("✓", 42, tone="confirm")
+        self.ok.clicked.connect(self.accept)
+        layout.addWidget(self.ok)
+
+    def open_for(self, todo_id: str, current: str, point: QPoint) -> None:
+        self._todo_id = todo_id
+        self.move(point)
+        self.input.setText(current)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(0, lambda: (self.input.setFocus(Qt.PopupFocusReason), self.input.selectAll()))
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.WindowDeactivate:
+            self.hide()
+        return super().event(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            self.hide()
+            return
+        super().keyPressEvent(event)
+
+    def accept(self) -> None:
+        if self._todo_id is not None:
+            self.parent_window.set_ddl(self._todo_id, self.input.text().strip())
+        self._todo_id = None
         self.hide()
 
 
@@ -665,6 +1011,13 @@ class SettingsWindow(QDialog):
         layout.addWidget(self.scroll, 1)
 
         self._section("外观")
+        self.skin = self._combo_row(
+            "皮肤",
+            "磨砂玻璃更省性能、文字更易读，推荐低配电脑使用；液态玻璃为实时折射特效。",
+            {"磨砂玻璃（推荐）": "acrylic", "液态玻璃": "glass"},
+            self.app.state.settings.skin,
+        )
+        self.skin.currentIndexChanged.connect(self._apply)
         self.opacity, self.opacity_value = self._slider_row("透明光泽", "控制玻璃底色染色强度，越低越通透。", int(self.app.state.settings.glassOpacity * 100), 0, 38, "%")
         self.opacity.valueChanged.connect(lambda value: self._slider_changed(self.opacity_value, value, "%"))
         self.strength, self.strength_value = self._slider_row("液态强度", "调节边缘折射、色散和高光的存在感。", int(self.app.state.settings.liquidStrength * 100), 20, 140, "%")
@@ -687,6 +1040,27 @@ class SettingsWindow(QDialog):
         self.position.currentIndexChanged.connect(self._apply)
         self.startup = self._switch_row("开机自启动", "登录 Windows 后自动启动桌面备忘。", self._last_startup_checked)
         self.startup.checkedChanged.connect(lambda _checked: self._apply())
+        self.edge_autohide = self._switch_row(
+            "贴边自动隐藏", "把窗口拖到屏幕左/右/上边缘即停靠，鼠标离开后自动滑出隐藏，移回边缘再滑回。",
+            self.app.state.settings.edgeAutoHide,
+        )
+        self.edge_autohide.checkedChanged.connect(lambda _checked: self._apply())
+
+        self._section("日历订阅")
+        self.calendar_enabled = self._switch_row(
+            "启用日历订阅", "开启后自动同步 ICS / webcal 日历链接中近 N 天的日程。", self.app.state.settings.calendarEnabled
+        )
+        self.calendar_enabled.checkedChanged.connect(lambda _checked: self._apply())
+        self.calendar_url = self._lineedit_row(
+            "订阅链接", "粘贴 Google / Outlook / Apple 的 ICS 或 webcal 日历地址。",
+            self.app.state.settings.calendarUrl, "https://… .ics 或 webcal://…",
+        )
+        self.calendar_url.editingFinished.connect(self._apply)
+        self.calendar_days = self._spinbox_row(
+            "同步未来天数", "只同步从今天起这么多天内的日程。", self.app.state.settings.calendarSyncDays, 1, 30
+        )
+        self.calendar_days.valueChanged.connect(lambda _value: self._apply())
+        self._calendar_status_row()
 
         self.form.addStretch()
 
@@ -763,6 +1137,64 @@ class SettingsWindow(QDialog):
         self.form.addWidget(FluentSettingRow(title, content, switch))
         return switch
 
+    def _lineedit_row(self, title: str, content: str, value: str, placeholder: str) -> LineEdit:
+        edit = LineEdit()
+        edit.setFixedWidth(300)
+        edit.setText(value)
+        edit.setPlaceholderText(placeholder)
+        edit.setClearButtonEnabled(True)
+        self.form.addWidget(FluentSettingRow(title, content, edit))
+        return edit
+
+    def _spinbox_row(self, title: str, content: str, value: int, minimum: int, maximum: int) -> SpinBox:
+        spin = SpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setValue(value)
+        spin.setFixedWidth(120)
+        self.form.addWidget(FluentSettingRow(title, content, spin))
+        return spin
+
+    def _calendar_status_row(self) -> None:
+        control = QWidget()
+        control.setFixedWidth(300)
+        layout = QHBoxLayout(control)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        self.calendar_status_label = BodyLabel("")
+        self.calendar_status_label.setWordWrap(True)
+        self.calendar_status_label.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,150); font-size: 12px;")
+        sync_button = PushButton("立即同步")
+        sync_button.clicked.connect(self._sync_calendar_now)
+        layout.addWidget(self.calendar_status_label, 1)
+        layout.addWidget(sync_button)
+        self.form.addWidget(FluentSettingRow("同步状态", "手动触发一次同步，或查看上次结果。", control))
+        self.refresh_calendar_status()
+
+    def _sync_calendar_now(self) -> None:
+        self._apply(save_now=True)
+        self.app.calendar.sync_now()
+
+    def refresh_calendar_status(self, syncing: bool = False) -> None:
+        if not hasattr(self, "calendar_status_label"):
+            return
+        state = self.app.state
+        if syncing:
+            text = "正在同步…"
+        elif state.calendarLastError:
+            text = f"同步失败：{state.calendarLastError}"
+        elif state.calendarLastSync:
+            text = f"上次同步 {self._format_local_time(state.calendarLastSync)}（{len(state.calendarEvents)} 条）"
+        else:
+            text = "尚未同步"
+        self.calendar_status_label.setText(text)
+
+    @staticmethod
+    def _format_local_time(iso_utc: str) -> str:
+        try:
+            return datetime.fromisoformat(iso_utc).astimezone().strftime("%m-%d %H:%M")
+        except (ValueError, TypeError):
+            return str(iso_utc)[:16]
+
     def _pick_color(self, control: QWidget, swatch: QFrame, button: PushButton, title: str) -> None:
         current = str(control.property("selectedColor") or "#F8FBFF")
         dialog = ColorDialog(QColor(current), title, self)
@@ -789,13 +1221,19 @@ class SettingsWindow(QDialog):
     def sync_from_state(self) -> None:
         settings = self.app.state.settings
         blockers = [
+            self.skin.blockSignals(True),
             self.opacity.blockSignals(True),
             self.strength.blockSignals(True),
             self.font_mode.blockSignals(True),
             self.complete.blockSignals(True),
             self.position.blockSignals(True),
             self.startup.blockSignals(True),
+            self.edge_autohide.blockSignals(True),
+            self.calendar_enabled.blockSignals(True),
+            self.calendar_url.blockSignals(True),
+            self.calendar_days.blockSignals(True),
         ]
+        self.skin.setCurrentIndex(max(0, self.skin.findData(settings.skin)))
         self.opacity.setValue(int(settings.glassOpacity * 100))
         self.opacity_value.setText(f"{self.opacity.value()}%")
         self.strength.setValue(int(settings.liquidStrength * 100))
@@ -808,8 +1246,14 @@ class SettingsWindow(QDialog):
         self.position.setCurrentIndex(max(0, self.position.findData(self.app.state.window.startPosition)))
         self._last_startup_checked = is_startup_enabled()
         self.startup.setChecked(self._last_startup_checked)
+        self.edge_autohide.setChecked(settings.edgeAutoHide)
+        self.calendar_enabled.setChecked(settings.calendarEnabled)
+        self.calendar_url.setText(settings.calendarUrl)
+        self.calendar_days.setValue(settings.calendarSyncDays)
+        self.refresh_calendar_status()
         for widget, blocked in zip(
-            [self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup],
+            [self.skin, self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup,
+             self.edge_autohide, self.calendar_enabled, self.calendar_url, self.calendar_days],
             blockers,
         ):
             widget.blockSignals(blocked)
@@ -830,10 +1274,15 @@ class SettingsWindow(QDialog):
         self._last_startup_checked = False
         self.sync_from_state()
         self._apply(save_now=True)
-        self.app.window.reset_capture_pipeline("reset-defaults")
+        self.app.calendar.on_settings_changed()  # stop syncing + hide 日程 group on reset
+        # _apply already drove the skin transition; only the glass pipeline needs a hard reset
+        # (the acrylic skin runs no capture loop, so resetting it would only spin a no-op timer).
+        if self.app.state.settings.skin == "glass":
+            self.app.window.reset_capture_pipeline("reset-defaults")
 
     def _apply(self, *_args, save_now: bool = False) -> None:
         settings = self.app.state.settings
+        settings.skin = str(self.skin.currentData())
         settings.glassOpacity = self.opacity.value() / 100
         settings.liquidStrength = self.strength.value() / 100
         settings.windowTint = self._control_color(self.window_color, settings.windowTint)
@@ -842,6 +1291,7 @@ class SettingsWindow(QDialog):
         settings.fontColorMode = str(self.font_mode.currentData())
         settings.completeBehavior = str(self.complete.currentData())
         settings.layerMode = "alwaysVisibleClickThrough"
+        settings.edgeAutoHide = self.edge_autohide.isChecked()
         self.app.state.window.startPosition = str(self.position.currentData())
         if self.app.state.window.startPosition == "current":
             self.app.state.window.x = self.app.window.x()
@@ -851,22 +1301,104 @@ class SettingsWindow(QDialog):
         if startup_checked != self._last_startup_checked:
             set_startup(startup_checked)
             self._last_startup_checked = startup_checked
+
+        # Calendar: detect a change so we only (re)sync when the subscription actually changes.
+        calendar_before = (settings.calendarEnabled, settings.calendarUrl, settings.calendarSyncDays)
+        settings.calendarEnabled = self.calendar_enabled.isChecked()
+        settings.calendarUrl = self.calendar_url.text().strip()
+        settings.calendarSyncDays = int(self.calendar_days.value())
+        calendar_changed = calendar_before != (settings.calendarEnabled, settings.calendarUrl, settings.calendarSyncDays)
+
         if save_now:
             self.app.save()
         else:
             self.app.save_later()
         self.app.window.apply_settings()
+        if calendar_changed:
+            self.app.calendar.on_settings_changed()
+
+
+# Fixed vertical chrome inside the window that is NOT glass padding: the top bar (drag handle +
+# buttons), its spacing to the list, and the scroll's inner margins. The window height is solved
+# so that, after the proportional glass padding, this block + the rows + corner margin all fit
+# inside the glass. (Originally folded into a 104px magic constant alongside the static margins.)
+MEMO_TOP_BLOCK = 68
+
+
+class GlassSkin:
+    """Liquid-glass skin: defines the background geometry and the content insets that keep rows
+    inside the visible glass. The glass rounded-rect is the window scaled by `geometry_scale`, so
+    it leaves a margin proportional to the window size on every side; content must inset by that
+    same proportional padding or it spills into the transparent gap (most visible at the bottom
+    once the window grows tall, e.g. in expanded mode).
+
+    Future skins (e.g. a flat translucent panel for low-end PCs) can set geometry_scale = 1.0
+    (no padding, content fills the window) and uses_glass = False; the inset math below degrades
+    to the static corner margin with no special-casing."""
+
+    kind = "glass"
+    geometry_scale = 0.94
+    radius_ratio = 0.24
+    corner_margin = 8  # rounded-corner avoidance + a little breathing room
+    uses_glass = True
+
+    def vertical_padding(self, height: int) -> int:
+        return round(height * (1.0 - self.geometry_scale) / 2.0)
+
+    def horizontal_padding(self, width: int) -> int:
+        return round(width * (1.0 - self.geometry_scale) / 2.0)
+
+
+class AcrylicSkin:
+    """Lightweight frosted-glass skin for low-end PCs. The window is a translucent DWM
+    acrylic surface (rounded by DWM, not an SDF) with no GPU screen capture, no effect chain,
+    and no contrast sampling — so the whole window IS the surface (geometry_scale = 1.0) and
+    content fills it with only a small corner margin. uses_glass = False makes the inset math
+    in _resize_for_content collapse to the static corner margin."""
+
+    kind = "acrylic"
+    geometry_scale = 1.0
+    radius_ratio = 0.0
+    corner_margin = 14
+    uses_glass = False
+
+    def vertical_padding(self, height: int) -> int:
+        return 0
+
+    def horizontal_padding(self, width: int) -> int:
+        return 0
+
+
+# Acrylic frost tint opacity (alpha over the blurred desktop). Kept at a readability floor so
+# even a busy/terminal desktop behind the window is pressed into a near-uniform surface.
+ACRYLIC_TINT_ALPHA = 0xB3  # ~0.70
+# Deterministic text colors for the acrylic skin, chosen by the frost tint's luminance: a soft
+# near-black on light frost, a soft near-white on dark frost (not pure #000/#FFF — calmer).
+ACRYLIC_TEXT_DARK = "#1B2127"
+ACRYLIC_TEXT_LIGHT = "#E8ECEF"
 
 
 class MemoWindow(OneGPUWidget):
     def __init__(self, app: "LiquidMemoApp") -> None:
         super().__init__(qt_move=False)
         self.app = app
+        self.skin = self._make_skin(app.state.settings.skin)
+        # Tracks which rendering mode is currently live so apply_settings only performs the
+        # (heavier) glass<->acrylic transition when the skin actually changes.
+        self._active_skin_kind: str | None = None
+        self._window_effect = WindowsWindowEffect(self)
+        self._acrylic_applied = False
+        self._acrylic_signature: str | None = None
         self.setWindowTitle("桌面备忘")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
         self._rows: dict[str, TodoRow] = {}
+        self._event_rows: dict[str, CalendarRow] = {}
+        self._calendar_header: QLabel | None = None
+        # Expanded mode grows the window to fit all content (no height clamp, no scrollbar, no
+        # elided text); collapsed mode keeps the default clamp + scroll behavior.
+        self._expanded = False
         self._shown_once = False
         self._sampled_background = QColor(246, 248, 252)
         self._background_complexity = 0.0
@@ -893,9 +1425,28 @@ class MemoWindow(OneGPUWidget):
         self._contrast_refresh_timer.setSingleShot(True)
         self._contrast_refresh_timer.timeout.connect(lambda: self.update_auto_contrast(force=True))
         self._build_content()
+        # Global wheel hook: scroll the list whenever the cursor is over it, bypassing the
+        # click-through hit-testing that otherwise sends wheel events to the desktop below.
+        self._wheel_hook = GlobalWheelHook(self._on_global_wheel)
+        self._wheel_hook.install()
+
+        # ── Edge auto-hide (dock) state ──────────────────────────────────────────────────
+        self._dock_edge: str | None = None      # "left"/"right"/"top" while docked, else None
+        self._dock_hidden = False               # True when slid off-screen (only peek showing)
+        self._dock_animating = False            # suppresses moveEvent side effects during slide
+        self._dock_shown_pos: QPoint | None = None  # flush-against-edge position (fully visible)
+        self._slide_anim: QPropertyAnimation | None = None
+        # Cursor poll runs only while docked-and-shown: detects the cursor leaving the window so
+        # the hide countdown can start (the click-through body never delivers leave events).
+        self._dock_poll = QTimer(self)
+        self._dock_poll.setInterval(DOCK_POLL_MS)
+        self._dock_poll.timeout.connect(self._dock_tick)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._hide_docked)
 
     def schedule_contrast_refresh(self, delay: int = 180) -> None:
-        if self.app.state.settings.fontColorMode == "manual":
+        if self.app.state.settings.skin == "acrylic" or self.app.state.settings.fontColorMode == "manual":
             return
         self._contrast_refresh_timer.start(delay)
 
@@ -914,6 +1465,10 @@ class MemoWindow(OneGPUWidget):
         self.drag_handle = DragHandle(self)
         top.addWidget(self.drag_handle)
         top.addStretch()
+        self.expand_button = RoundButton("▾", tone="neutral")
+        self.expand_button.setToolTip("展开全部")
+        self.expand_button.clicked.connect(self.toggle_expanded)
+        top.addWidget(self.expand_button)
         self.add_button = RoundButton("+", tone="add")
         self.add_button.setToolTip("添加注意事项")
         self.add_button.clicked.connect(self.show_add_popup)
@@ -928,7 +1483,13 @@ class MemoWindow(OneGPUWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.setStyleSheet("QScrollArea { background: transparent; border: none; } QScrollBar:vertical { width: 6px; background: transparent; } QScrollBar::handle:vertical { background: rgba(17,24,32,70); border-radius: 3px; }")
+        self.scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            " QScrollBar:vertical { width: 9px; background: transparent; margin: 2px 1px; }"
+            " QScrollBar::handle:vertical { background: rgba(17,24,32,80); border-radius: 4px; min-height: 36px; }"
+            " QScrollBar::handle:vertical:hover { background: rgba(17,24,32,130); }"
+            " QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
         self.list_widget = QWidget()
         self.list_widget.setStyleSheet("background: transparent;")
         self.list_layout = QVBoxLayout(self.list_widget)
@@ -943,6 +1504,7 @@ class MemoWindow(OneGPUWidget):
         self.layout.addWidget(self.empty, 1)
 
         self.add_popup = AddTodoPopup(self)
+        self.edit_ddl_popup = EditDDLPopup(self)
 
     def protect_content_layer(self) -> None:
         if self.container:
@@ -1006,6 +1568,8 @@ class MemoWindow(OneGPUWidget):
         # window's region; the stock loop presented those directly, which is the visible
         # black<->transparent flicker. Here every captured frame is read back and checked
         # first — a blank frame is dropped and the last good output stays on screen.
+        if self._active_skin_kind == "acrylic":
+            return  # frosted skin does no screen capture; the DWM acrylic follows the window
         d3d = self._d3d
         if not d3d._presenter_id or d3d._capture_w <= 0 or d3d._capture_h <= 0:
             return
@@ -1069,21 +1633,44 @@ class MemoWindow(OneGPUWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        # In frosted mode the D3D surface is never presented; hide it before the first paint so
+        # its blank swapchain doesn't flash over the acrylic before apply_settings runs.
+        if self.app.state.settings.skin == "acrylic" and not self._d3d.isHidden():
+            self._d3d.hide()
         # Keep our own text/control layer out of the GPU screen capture. Otherwise
         # the next liquid-glass frame captures and refracts the text itself.
         self.protect_content_layer()
         for delay in (0, 80, 180, 420):
             QTimer.singleShot(delay, self.protect_content_layer)
+        # Re-showing (e.g. from the tray) while docked-hidden would otherwise reveal the window
+        # at its off-screen position — snap it back out so it is actually visible.
+        if self._dock_edge is not None and self._dock_hidden:
+            self._reveal_docked()
         if not self._shown_once:
             self._shown_once = True
             self.apply_initial_geometry()
             QTimer.singleShot(80, self.refresh)
             QTimer.singleShot(180, self.apply_text_colors)
+            # Restore a dock if the saved position sits against an edge.
+            QTimer.singleShot(280, self._maybe_dock)
         QTimer.singleShot(0, self.apply_settings)
+
+    def hideEvent(self, event) -> None:
+        # Suspend dock timers/animation while the window is hidden (e.g. from the tray); showEvent
+        # restores the dock. _dock_edge/_dock_hidden are kept so the state survives a hide/show.
+        self._dock_poll.stop()
+        self._hide_timer.stop()
+        self._cancel_slide()
+        self._dock_animating = False
+        super().hideEvent(event)
 
     def moveEvent(self, event) -> None:
         super().moveEvent(event)
         if self._shown_once:
+            # During a dock slide the window is mid-animation toward an off-screen position; skip
+            # the per-move capture/save/contrast work (and don't persist off-screen coordinates).
+            if self._dock_animating:
+                return
             self.app.state.window.x = self.x()
             self.app.state.window.y = self.y()
             if self._is_window_moving:
@@ -1104,12 +1691,21 @@ class MemoWindow(OneGPUWidget):
                 x = ctypes.c_short(msg.lParam & 0xFFFF).value
                 y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
                 local = self.mapFromGlobal(QPoint(x, y))
+                # While hidden, the on-screen peek strip must be HTCLIENT (not click-through) so
+                # the window receives WM_MOUSEMOVE over it and can slide back out.
+                if self._dock_hidden and not self._dock_animating and self._peek_rect_local().contains(local):
+                    return True, HTCLIENT
                 if self._rect_for(self.drag_handle).contains(local):
                     return True, HTCAPTION
                 if self._is_interactive_point(local):
                     return True, HTCLIENT
                 if self.app.state.settings.layerMode == "alwaysVisibleClickThrough":
                     return True, HTTRANSPARENT
+            if msg.message == WM_MOUSEMOVE:
+                # Only the peek strip is HTCLIENT while hidden, so any mouse-move here means the
+                # cursor reached the strip — slide the window back out.
+                if self._dock_hidden and not self._dock_animating:
+                    self._show_docked()
             if msg.message == WM_ENTERSIZEMOVE:
                 self._begin_window_move()
             elif msg.message == WM_EXITSIZEMOVE:
@@ -1121,9 +1717,16 @@ class MemoWindow(OneGPUWidget):
         return QRect(top_left, widget.size())
 
     def _is_interactive_point(self, point: QPoint) -> bool:
-        widgets: list[QWidget] = [self.add_button, self.hide_button]
+        widgets: list[QWidget] = [self.add_button, self.hide_button, self.expand_button]
         for row in self._rows.values():
-            widgets.extend([row.checkbox, row.urgent])
+            # ddl_label is the editable DDLCell (click-to-edit); the time cell on calendar rows
+            # is display-only, so only their checkbox is interactive.
+            widgets.extend([row.checkbox, row.urgent, row.ddl_label])
+        for row in self._event_rows.values():
+            widgets.append(row.checkbox)
+        # Wheel scrolling over the list is handled by the global wheel hook (see
+        # _on_global_wheel), so the list area can stay click-through: only the discrete controls
+        # below are interactive, everything else passes clicks to the desktop.
         return any(widget.isVisible() and self._rect_for(widget).adjusted(-4, -4, 4, 4).contains(point) for widget in widgets)
 
     def begin_system_move(self) -> None:
@@ -1135,6 +1738,8 @@ class MemoWindow(OneGPUWidget):
         if self._is_window_moving:
             return
         self._is_window_moving = True
+        if self._active_skin_kind == "acrylic":
+            return  # the frost follows the window via DWM — no capture loop to spin up
         self._contrast_was_active = self._contrast_timer.isActive()
         self._contrast_timer.stop()
         self.refresh_capture_after_idle()
@@ -1147,12 +1752,217 @@ class MemoWindow(OneGPUWidget):
         self.app.state.window.x = self.x()
         self.app.state.window.y = self.y()
         self.app.save_later()
+        if self._active_skin_kind == "acrylic":
+            self.protect_content_layer()
+            self._maybe_dock()
+            return
         self.sync_capture_position(render=True)
         self.protect_content_layer()
         self.start(fps=REST_FPS)
         if self.app.state.settings.fontColorMode != "manual":
             self._contrast_timer.start()
             self.schedule_contrast_refresh()
+        self._maybe_dock()
+
+    # ── Edge auto-hide (dock) ────────────────────────────────────────────────────────────
+    def _dock_geometry(self) -> QRect:
+        screen = self.screen() or QApplication.primaryScreen()
+        return screen.availableGeometry()
+
+    def _dock_pos(self, hidden: bool) -> QPoint:
+        """The window position for the current dock edge, either flush-visible or slid out to a
+        DOCK_PEEK strip. The cross-axis (position along the edge) comes from the snapped shown
+        position; the perpendicular axis is recomputed from the live window size."""
+        g = self._dock_geometry()
+        w, h = self.width(), self.height()
+        shown = self._dock_shown_pos or self.pos()
+        if self._dock_edge == "left":
+            x = (g.left() - w + DOCK_PEEK) if hidden else g.left()
+            return QPoint(x, shown.y())
+        if self._dock_edge == "right":
+            x = (g.left() + g.width() - DOCK_PEEK) if hidden else (g.left() + g.width() - w)
+            return QPoint(x, shown.y())
+        y = (g.top() - h + DOCK_PEEK) if hidden else g.top()  # "top"
+        return QPoint(shown.x(), y)
+
+    def _peek_rect_local(self) -> QRect:
+        w, h = self.width(), self.height()
+        if self._dock_edge == "left":
+            return QRect(w - DOCK_PEEK, 0, DOCK_PEEK, h)
+        if self._dock_edge == "right":
+            return QRect(0, 0, DOCK_PEEK, h)
+        if self._dock_edge == "top":
+            return QRect(0, h - DOCK_PEEK, w, DOCK_PEEK)
+        return QRect()
+
+    def _maybe_dock(self) -> None:
+        # Called after a move ends: dock to the nearest edge within threshold, else undock.
+        if not self.app.state.settings.edgeAutoHide or not self.isVisible():
+            self._undock()
+            return
+        g = self._dock_geometry()
+        x, y, w, h = self.x(), self.y(), self.width(), self.height()
+        gaps = {
+            "left": x - g.left(),
+            "right": (g.left() + g.width()) - (x + w),
+            "top": y - g.top(),
+        }
+        edge = min(gaps, key=gaps.get)
+        if gaps[edge] > DOCK_THRESHOLD:
+            self._undock()
+            return
+        self._dock_edge = edge
+        self._dock_hidden = False
+        if edge == "left":
+            shown = QPoint(g.left(), y)
+        elif edge == "right":
+            shown = QPoint(g.left() + g.width() - w, y)
+        else:
+            shown = QPoint(x, g.top())
+        self._dock_shown_pos = shown
+        if self.pos() != shown:
+            self.move(shown)
+        self._dock_shown_pos = self.pos()
+        self._hide_timer.stop()
+        self._dock_poll.start(DOCK_POLL_MS)
+
+    def _undock(self) -> None:
+        if self._dock_edge is None:
+            self._dock_hidden = False
+            return
+        if self._dock_hidden:
+            self._reveal_docked()  # never leave the window stranded off-screen
+        self._dock_edge = None
+        self._dock_hidden = False
+        self._dock_animating = False
+        self._dock_shown_pos = None
+        self._dock_poll.stop()
+        self._hide_timer.stop()
+        self._cancel_slide()
+        if self._active_skin_kind == "glass":
+            self.ensure_frame_loop(REST_FPS)
+
+    def _reposition_dock(self) -> None:
+        target = self._dock_pos(self._dock_hidden)
+        if self.pos() == target:
+            return
+        if self._dock_hidden:
+            self._dock_animating = True
+            self.move(target)
+            self._dock_animating = False
+        else:
+            self.move(target)
+            self._dock_shown_pos = self.pos()
+
+    def _reveal_docked(self) -> None:
+        # Instant (no slide) reveal to the flush position — used on tray re-show and undock.
+        self._cancel_slide()
+        self._dock_animating = True
+        self.move(self._dock_pos(hidden=False))
+        self._dock_animating = False
+        self._dock_hidden = False
+        if self._active_skin_kind == "glass":
+            self.ensure_frame_loop(REST_FPS)
+            self.sync_capture_position(render=True)
+        self.protect_content_layer()
+        if self._dock_edge is not None:
+            self._dock_poll.start(DOCK_POLL_MS)
+
+    def _hide_docked(self) -> None:
+        if self._dock_edge is None or self._dock_hidden or self._dock_animating:
+            return
+        if self._suppress_hide():
+            return
+        self._dock_hidden = True
+        self._hide_timer.stop()
+        # The poll keeps running while hidden: it is what detects the cursor reaching the peek
+        # strip. (WM_MOUSEMOVE on the strip proved unreliable in practice — the mostly off-screen
+        # HTCLIENT sliver does not dependably receive mouse messages.)
+        self._animate_to(self._dock_pos(hidden=True))
+
+    def _show_docked(self) -> None:
+        if self._dock_edge is None or not self._dock_hidden or self._dock_animating:
+            return
+        self._dock_hidden = False
+        if self._active_skin_kind == "glass":
+            self.ensure_frame_loop(REST_FPS)
+        self._animate_to(self._dock_pos(hidden=False))
+        self._dock_poll.start(DOCK_POLL_MS)
+
+    def _animate_to(self, target: QPoint) -> None:
+        self._cancel_slide()
+        if self.pos() == target:
+            self._on_slide_finished()
+            return
+        anim = QPropertyAnimation(self, b"pos", self)
+        anim.setDuration(DOCK_SLIDE_MS)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(self.pos())
+        anim.setEndValue(target)
+        anim.finished.connect(self._on_slide_finished)
+        self._dock_animating = True
+        self._slide_anim = anim
+        anim.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def _cancel_slide(self) -> None:
+        if self._slide_anim is not None:
+            try:
+                self._slide_anim.stop()
+            except RuntimeError:
+                pass
+            self._slide_anim = None
+
+    def _on_slide_finished(self) -> None:
+        self._dock_animating = False
+        self._slide_anim = None
+        if self._active_skin_kind == "glass":
+            if self._dock_hidden:
+                self.stop()  # fully off-screen: stop the capture loop (saves power)
+            else:
+                self.refresh_capture_after_idle()
+                self.ensure_frame_loop(REST_FPS)
+                self.sync_capture_position(render=True)
+        self.protect_content_layer()
+
+    def _peek_rect_global(self) -> QRect:
+        # The on-screen strip of the hidden window, in global coordinates, with a small inward
+        # tolerance so the cursor doesn't have to land on the exact 5px sliver.
+        g = self._dock_geometry()
+        if self._dock_edge == "left":
+            return QRect(g.left(), self.y(), DOCK_PEEK + 2, self.height())
+        if self._dock_edge == "right":
+            return QRect(g.left() + g.width() - DOCK_PEEK - 2, self.y(), DOCK_PEEK + 2, self.height())
+        if self._dock_edge == "top":
+            return QRect(self.x(), g.top(), self.width(), DOCK_PEEK + 2)
+        return QRect()
+
+    def _dock_tick(self) -> None:
+        # Poll while docked. Shown: start the hide countdown when the cursor leaves the window.
+        # Hidden: watch for the cursor reaching the peek strip and slide back out.
+        if self._dock_edge is None or self._dock_animating:
+            return
+        cursor = QCursor.pos()
+        if self._dock_hidden:
+            if self._peek_rect_global().contains(cursor):
+                self._show_docked()
+            return
+        if self._suppress_hide():
+            self._hide_timer.stop()
+            return
+        inside = self.frameGeometry().adjusted(-3, -3, 3, 3).contains(cursor)
+        if inside:
+            self._hide_timer.stop()
+        elif not self._hide_timer.isActive():
+            self._hide_timer.start(DOCK_HIDE_DELAY_MS)
+
+    def _suppress_hide(self) -> bool:
+        return (
+            self._is_window_moving
+            or self.add_popup.isVisible()
+            or self.edit_ddl_popup.isVisible()
+            or self.app.settings_window.isVisible()
+            or self.app.history_window.isVisible()
+        )
 
     def apply_initial_geometry(self) -> None:
         self.refresh()
@@ -1168,8 +1978,36 @@ class MemoWindow(OneGPUWidget):
         y = screen.bottom() - self.height() - 32 if "bottom" in state.startPosition else screen.top() + 32
         self.move(x, y)
 
+    def _make_skin(self, skin_name: str):
+        return AcrylicSkin() if skin_name == "acrylic" else GlassSkin()
+
     def apply_settings(self, refresh_rows: bool = False, reset_capture: bool = False) -> None:
         settings = self.app.state.settings
+        skin_changed = self._active_skin_kind not in (None, settings.skin)
+        self.skin = self._make_skin(settings.skin)
+        if settings.skin == "acrylic":
+            self._apply_acrylic_mode()
+        else:
+            self._apply_glass_mode(reset_capture)
+        # The two skins use different content insets/geometry (glass padding vs acrylic
+        # full-fill), so a skin switch needs a relayout even if the caller didn't ask for one.
+        if refresh_rows or skin_changed:
+            self.refresh()
+        self.protect_content_layer()
+        self.apply_window_layer()
+        if not settings.edgeAutoHide:
+            self._undock()
+
+    def _apply_glass_mode(self, reset_capture: bool = False) -> None:
+        settings = self.app.state.settings
+        if self._active_skin_kind not in (None, "glass"):
+            # Coming back from acrylic: drop the frost, re-show the D3D surface, and rebuild the
+            # capture pipeline (it was stopped / went stale while frosted).
+            self._remove_acrylic()
+            self._d3d.show()
+            reset_capture = True
+        self._active_skin_kind = "glass"
+
         if reset_capture:
             self.reset_capture_pipeline("settings")
         elif not self._capture_source_ready:
@@ -1196,10 +2034,6 @@ class MemoWindow(OneGPUWidget):
             self.update_effects(build_effect_params(EFFECTS_PARAMS, settings.windowTint, settings.glassOpacity, settings.liquidStrength))
             self._effect_signature = effect_signature
         self.ensure_frame_loop(fps=REST_FPS)
-        if refresh_rows:
-            self.refresh()
-        self.protect_content_layer()
-        self.apply_window_layer()
         if settings.fontColorMode == "manual":
             self._contrast_timer.stop()
             self.apply_text_colors()
@@ -1207,6 +2041,41 @@ class MemoWindow(OneGPUWidget):
             if not self._contrast_timer.isActive():
                 self._contrast_timer.start()
             self.schedule_contrast_refresh()
+
+    def _apply_acrylic_mode(self) -> None:
+        # Frosted mode: no screen capture, no effect chain, no contrast sampling. The window is
+        # a translucent DWM acrylic surface; the D3D child is hidden so the frost shows through.
+        self._active_skin_kind = "acrylic"
+        self._contrast_timer.stop()
+        self.stop()
+        if not self._d3d.isHidden():
+            self._d3d.hide()
+        self._apply_acrylic_effect()
+        self.apply_text_colors()
+
+    def _apply_acrylic_effect(self) -> None:
+        settings = self.app.state.settings
+        tint = qcolor(settings.windowTint, "#F2F4F7")
+        gradient = f"{tint.red():02X}{tint.green():02X}{tint.blue():02X}{ACRYLIC_TINT_ALPHA:02X}"
+        if self._acrylic_applied and gradient == self._acrylic_signature:
+            return  # avoid re-issuing the composition attribute on every slider tick (flicker)
+        hwnd = int(self.winId())
+        self._window_effect.setAcrylicEffect(hwnd, gradient, enableShadow=True)
+        set_rounded_corners(hwnd, True)
+        self._acrylic_applied = True
+        self._acrylic_signature = gradient
+
+    def _remove_acrylic(self) -> None:
+        if not self._acrylic_applied:
+            return
+        try:
+            hwnd = int(self.winId())
+            self._window_effect.removeBackgroundEffect(hwnd)
+            set_rounded_corners(hwnd, False)
+        except Exception:
+            pass
+        self._acrylic_applied = False
+        self._acrylic_signature = None
 
     def apply_window_layer(self) -> None:
         # SetWindowPos/Z-order churn on every apply_settings call makes the window flash;
@@ -1219,35 +2088,115 @@ class MemoWindow(OneGPUWidget):
         set_topmost(hwnd, True)
         self._window_layer_applied = True
 
+    @staticmethod
+    def _todo_sort_key(item: TodoItem) -> tuple:
+        # Urgent items stay pinned to the top (existing behavior). Within each group, items
+        # with a parseable deadline sort by it (earliest first); items without a usable date
+        # fall back to their manual order, landing after the dated ones.
+        deadline = parse_ddl(item.ddl)
+        ddl_rank = deadline.timestamp() if deadline else float("inf")
+        return (not item.urgent, ddl_rank, item.order, item.createdAt)
+
     def refresh(self) -> None:
         while self.list_layout.count():
             item = self.list_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
         self._rows.clear()
+        self._event_rows.clear()
+        self._calendar_header = None
 
-        active = sorted(self.app.state.todos, key=lambda item: (not item.urgent, item.order, item.createdAt))
-        self.scroll.setVisible(bool(active))
-        self.empty.setVisible(not active)
+        active = sorted(self.app.state.todos, key=self._todo_sort_key)
+        events = self._visible_calendar_events()
+        self.scroll.setVisible(bool(active) or bool(events))
+        self.empty.setVisible(not active and not events)
 
         for todo in active:
             row = TodoRow(todo, self.app.state.settings, self)
             self._rows[todo.id] = row
             self.list_layout.addWidget(row)
+
+        if events:
+            self._calendar_header = self._make_calendar_header()
+            self.list_layout.addWidget(self._calendar_header)
+            done = set(self.app.state.calendarDoneKeys)
+            for event in events:
+                row = CalendarRow(event, event.key in done, self)
+                self._event_rows[event.key] = row
+                self.list_layout.addWidget(row)
+
         self.list_layout.addStretch()
-        self._resize_for_content(active)
+        self._resize_for_content(active, events)
         self.apply_text_colors()
 
-    def text_color_for(self, todo: TodoItem) -> QColor:
+    def _visible_calendar_events(self) -> list[CalendarEvent]:
+        # Synced events are read-only and never archive to history (they would just re-sync),
+        # so unlike todos they ignore completeBehavior: checking one only dims + strikes it
+        # through in place and it stays visible until it drops out of the sync window.
+        if not self.app.state.settings.calendarEnabled:
+            return []
+        return list(self.app.state.calendarEvents)
+
+    def _make_calendar_header(self) -> QLabel:
+        header = QLabel("日程")
+        header.setFixedHeight(CALENDAR_HEADER_HEIGHT)
+        color = self._normal_text_color()
+        header.setStyleSheet(
+            f"{FONT_STACK_QSS} color: {css_rgba(color, 0.7)}; font-size: 11pt; font-weight: 600; padding-left: 6px;"
+        )
+        return header
+
+    def toggle_calendar_event(self, key: str, checked: bool) -> None:
+        self.app.calendar.toggle_event_done(key, checked)
+
+    def toggle_expanded(self) -> None:
+        self._expanded = not self._expanded
+        self.expand_button.setText("▴" if self._expanded else "▾")
+        self.expand_button.setToolTip("收起" if self._expanded else "展开全部")
+        self.refresh()
+
+    def _scroll_overflowing(self) -> bool:
+        bar = self.scroll.verticalScrollBar()
+        return bar is not None and bar.maximum() > 0
+
+    def _on_global_wheel(self, gx: int, gy: int, delta: int) -> bool:
+        # Invoked from the low-level mouse hook on the GUI thread's message pump. Scroll only
+        # when the list is visible, overflowing, and the cursor is over the scroll area; else
+        # return False so the wheel passes through to whatever is underneath.
+        if not self.isVisible() or not self.scroll.isVisible() or not self._scroll_overflowing():
+            return False
+        local = self.mapFromGlobal(QPoint(gx, gy))
+        if not self._rect_for(self.scroll).contains(local):
+            return False
+        bar = self.scroll.verticalScrollBar()
+        if bar is None:
+            return False
+        bar.setValue(bar.value() - round(delta / 120.0 * 60))
+        return True
+
+    def _acrylic_text_color(self) -> QColor:
+        # The frost tint dominates the surface, so contrast is deterministic: pick the soft
+        # dark or soft light text by the tint's luminance. No sampling, no neon, no flicker.
+        tint = qcolor(self.app.state.settings.windowTint, "#F2F4F7")
+        return best_contrast_color(tint, [ACRYLIC_TEXT_DARK, ACRYLIC_TEXT_LIGHT])
+
+    def _normal_text_color(self) -> QColor:
         settings = self.app.state.settings
-        if todo.urgent:
-            return qcolor(settings.urgentTextColor, "#FF0000")
+        if settings.skin == "acrylic":
+            return self._acrylic_text_color()
         if settings.fontColorMode == "manual":
             return qcolor(settings.todoTextColor)
         return QColor(self._auto_text_color)
 
+    def text_color_for(self, todo: TodoItem) -> QColor:
+        if todo.urgent:
+            return qcolor(self.app.state.settings.urgentTextColor, "#FF0000")
+        return self._normal_text_color()
+
     def text_needs_halo(self) -> bool:
         settings = self.app.state.settings
+        if settings.skin == "acrylic":
+            return False  # the frost is already a calm, even surface — no protective halo
         if settings.fontColorMode == "manual":
             return False
         return settings.fontColorMode == "autoEnhanced" or self._background_extremely_busy
@@ -1255,14 +2204,21 @@ class MemoWindow(OneGPUWidget):
     def apply_text_colors(self) -> None:
         for row in self._rows.values():
             row.apply_text_style(self.text_color_for(row.todo), self.text_needs_halo())
-        if self.app.state.settings.fontColorMode == "manual":
-            empty_color = qcolor(self.app.state.settings.todoTextColor)
-        else:
-            empty_color = QColor(self._auto_text_color)
-        self.empty.setStyleSheet(f"{FONT_STACK_QSS} color: {css_rgba(empty_color, 0.58)}; font-size: 15px;")
+        normal = self._normal_text_color()
+        for row in self._event_rows.values():
+            row.apply_text_style(normal, self.text_needs_halo())
+        if self._calendar_header is not None:
+            self._calendar_header.setStyleSheet(
+                f"{FONT_STACK_QSS} color: {css_rgba(normal, 0.7)}; font-size: 11pt; font-weight: 600; padding-left: 6px;"
+            )
+        # `normal` already resolves to the manual/auto/acrylic color, so it is the right base
+        # for the empty-state label in every skin and font mode.
+        self.empty.setStyleSheet(f"{FONT_STACK_QSS} color: {css_rgba(normal, 0.58)}; font-size: 15px;")
 
     def update_auto_contrast(self, force: bool = False) -> None:
-        if not self.isVisible() or self.app.state.settings.fontColorMode == "manual":
+        if not self.isVisible() or self.app.state.settings.skin == "acrylic":
+            return
+        if self.app.state.settings.fontColorMode == "manual":
             return
         sample = self._sample_background()
         if sample is None:
@@ -1375,48 +2331,103 @@ class MemoWindow(OneGPUWidget):
         )
         return average, complexity
 
-    def _resize_for_content(self, active: list[TodoItem]) -> None:
+    def _resize_for_content(self, active: list[TodoItem], events: list[CalendarEvent] | None = None) -> None:
+        events = events or []
         screen = QApplication.primaryScreen().availableGeometry()
-        width = self._adaptive_width(active, screen)
-        text_width = self._text_width_for_window(width)
-        row_heights = [self._row_height_for(todo, text_width) for todo in active]
-        content_height = sum(row_heights) if row_heights else ROW_HEIGHT
-        wanted = max(MIN_HEIGHT, 104 + content_height)
-        height = min(wanted, int(screen.height() * MAX_HEIGHT_RATIO), screen.height() - 64)
+        show_todo_ddl = any(todo.ddl for todo in active)
+        # The time column is shared by todo DDLs and event times; show it (and reserve width)
+        # whenever either group needs it, sizing to the widest string across both for alignment.
+        column_active = show_todo_ddl or bool(events)
+        ddl_width = self._time_column_width(active, events, self._expanded) if column_active else 0
+        ddl_reserve = (ddl_width + DDL_SEP_WIDTH + DDL_COL_GAPS) if column_active else 0
+        width = self._adaptive_width(active, events, screen, ddl_reserve)
+        text_width = self._text_width_for_window(width, ddl_reserve)
+        content_height = sum(self._measure_row_height(todo.text, text_width) for todo in active)
+        if events:
+            # Calendar rows render "📅 {summary}", which wraps (and grows taller than ROW_HEIGHT)
+            # for long titles — measure them like todos so the window height isn't underestimated
+            # (which previously left expanded mode hiding the scrollbar yet still clipping rows).
+            content_height += CALENDAR_HEADER_HEIGHT
+            content_height += sum(self._measure_row_height(f"📅 {event.summary}", text_width) for event in events)
+        content_height = max(content_height, ROW_HEIGHT)
+        # Solve the window height so that, after the glass's proportional vertical padding, the
+        # top block + rows + corner margin still fit inside the glass: H*scale = needed.
+        scale = self.skin.geometry_scale
+        corner = self.skin.corner_margin
+        needed = MEMO_TOP_BLOCK + content_height + 2 * corner
+        wanted = max(MIN_HEIGHT, math.ceil(needed / scale))
+        screen_cap = screen.height() - 64
+        if self._expanded:
+            # Grow to fit everything; only the physical screen limits us. Hide the scrollbar
+            # when it all fits, but fall back to AsNeeded if content still exceeds the screen.
+            height = min(wanted, screen_cap)
+            fits = wanted <= screen_cap
+            self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff if fits else Qt.ScrollBarAsNeeded)
+        else:
+            height = min(wanted, int(screen.height() * MAX_HEIGHT_RATIO), screen_cap)
+            self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         if self.width() != width or self.height() != height:
-            self.update_sdf(width, height, radius_ratio=0.24, scale=0.94)
+            self.update_sdf(width, height, radius_ratio=self.skin.radius_ratio, scale=scale)
             if self.container:
                 self.container.setFixedSize(width, height)
 
+        # Inset the content to the glass. Vertical follows the proportional glass padding so the
+        # bottom rows never cross the glass edge; horizontal keeps OUTER_X, which at our width
+        # range always already exceeds the glass's horizontal padding (so no change there).
+        pad_y = self.skin.vertical_padding(height)
+        pad_x = max(OUTER_X, self.skin.horizontal_padding(width))
+        self.layout.setContentsMargins(pad_x, pad_y + corner, pad_x, pad_y + corner)
+
         for row in self._rows.values():
-            row.apply_text_width(text_width)
+            row.apply_text_width(text_width, show_todo_ddl, ddl_width)
+        for row in self._event_rows.values():
+            row.apply_text_width(text_width, True, ddl_width)
 
         self._keep_inside_screen(screen)
         self.app.state.window.width = width
         self.app.state.window.height = height
+        if self._dock_edge is not None:
+            # Content resized while docked: re-pin to the (recomputed) dock position so the peek
+            # strip and slide geometry stay correct for the new size.
+            self._reposition_dock()
 
-    def _adaptive_width(self, active: list[TodoItem], screen: QRect) -> int:
-        if not active:
+    def _adaptive_width(self, active: list[TodoItem], events: list[CalendarEvent], screen: QRect, ddl_reserve: int = 0) -> int:
+        if not active and not events:
             return MIN_WIDTH
         metrics = QFontMetrics(mixed_font(12))
-        longest = max(metrics.horizontalAdvance(todo.text) for todo in active)
-        chrome = OUTER_X * 2 + 12 + 18 + 30 + 28 + 24
+        text_widths = [metrics.horizontalAdvance(todo.text) for todo in active]
+        text_widths += [metrics.horizontalAdvance(f"📅 {event.summary}") for event in events]
+        longest = max(text_widths) if text_widths else 0
+        chrome = OUTER_X * 2 + 12 + 18 + 30 + 28 + 24 + ddl_reserve
         max_width = min(MAX_WIDTH, int(screen.width() * MAX_WIDTH_RATIO), screen.width() - 64)
         return max(MIN_WIDTH, min(max_width, longest + chrome))
 
-    def _text_width_for_window(self, width: int) -> int:
-        return max(90, width - (OUTER_X * 2 + 12 + 18 + 30 + 28 + 12))
+    def _text_width_for_window(self, width: int, ddl_reserve: int = 0) -> int:
+        return max(90, width - (OUTER_X * 2 + 12 + 18 + 30 + 28 + 12) - ddl_reserve)
 
-    def _row_height_for(self, todo: TodoItem, text_width: int) -> int:
+    def _time_column_width(self, active: list[TodoItem], events: list[CalendarEvent], expanded: bool = False) -> int:
+        # Width that fits the widest deadline/event-time text in this view (so they show in
+        # full), clamped to [DDL_COL_MIN, cap]. Collapsed elides past DDL_COL_MAX; expanded
+        # lifts the cap so nothing is truncated.
+        metrics = QFontMetrics(mixed_font(11))
+        candidates = [todo.ddl.strip() for todo in active if todo.ddl.strip()]
+        candidates += [format_event_time(event) for event in events]
+        longest = max((metrics.horizontalAdvance(text) for text in candidates), default=0)
+        cap = DDL_COL_EXPANDED_MAX if expanded else DDL_COL_MAX
+        return max(DDL_COL_MIN, min(cap, longest + DDL_COL_PAD))
+
+    def _measure_row_height(self, text: str, text_width: int) -> int:
         metrics = QFontMetrics(mixed_font(12))
         flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
-        rect = metrics.boundingRect(QRect(0, 0, max(90, text_width), 2000), flags, todo.text)
+        rect = metrics.boundingRect(QRect(0, 0, max(90, text_width), 2000), flags, text)
         return max(ROW_HEIGHT, rect.height() + 18)
 
     def _keep_inside_screen(self, screen: QRect) -> None:
         if not self.isVisible():
             return
+        if self._dock_edge is not None:
+            return  # docked positions intentionally sit at / past the screen edge
         margin = 12
         x = min(max(self.x(), screen.left() + margin), screen.right() - self.width() - margin)
         y = min(max(self.y(), screen.top() + margin), screen.bottom() - self.height() - margin)
@@ -1435,9 +2446,32 @@ class MemoWindow(OneGPUWidget):
         y = min(max(y, screen.top() + 12), screen.bottom() - popup_height - 12)
         self.add_popup.open_near(QPoint(x, y), popup_width)
 
-    def add_todo(self, text: str) -> None:
+    def add_todo(self, text: str, ddl: str = "") -> None:
         next_order = max([todo.order for todo in self.app.state.todos] + [0]) + 1
-        self.app.state.todos.append(TodoItem(id=str(uuid4()), text=text, order=next_order))
+        self.app.state.todos.append(TodoItem(id=str(uuid4()), text=text, ddl=ddl, order=next_order))
+        self.app.save()
+        self.refresh()
+
+    def edit_ddl(self, todo_id: str) -> None:
+        todo = next((item for item in self.app.state.todos if item.id == todo_id), None)
+        if todo is None:
+            return
+        row = self._rows.get(todo_id)
+        screen = QApplication.primaryScreen().availableGeometry()
+        popup = self.edit_ddl_popup
+        if row is not None:
+            anchor = row.ddl_label.mapToGlobal(QPoint(0, row.ddl_label.height() + 6))
+        else:
+            anchor = QPoint(self.x(), self.y() + self.height() + 10)
+        x = min(max(anchor.x(), screen.left() + 12), screen.right() - popup.width() - 12)
+        y = min(max(anchor.y(), screen.top() + 12), screen.bottom() - popup.height() - 12)
+        popup.open_for(todo_id, todo.ddl, QPoint(x, y))
+
+    def set_ddl(self, todo_id: str, ddl: str) -> None:
+        todo = next((item for item in self.app.state.todos if item.id == todo_id), None)
+        if todo is None or todo.ddl == ddl:
+            return
+        todo.ddl = ddl
         self.app.save()
         self.refresh()
 
@@ -1477,6 +2511,106 @@ class MemoWindow(OneGPUWidget):
         anim.start(QPropertyAnimation.DeleteWhenStopped)
 
 
+class _CalendarSyncSignals(QObject):
+    finished = Signal(list)  # list[CalendarEvent]
+    failed = Signal(str)
+
+
+class _CalendarSyncTask(QRunnable):
+    """Fetch + parse on a thread-pool thread so the glass render loop never blocks."""
+
+    def __init__(self, url: str, days: int, signals: _CalendarSyncSignals) -> None:
+        super().__init__()
+        self.url = url
+        self.days = days
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            text = calendar_sync.fetch_ics(self.url)
+            events = calendar_sync.parse_events(text, self.days, datetime.now())
+            self.signals.finished.emit(events)
+        except Exception as exc:  # network/parse errors are reported to the UI, not fatal
+            self.signals.failed.emit(str(exc) or exc.__class__.__name__)
+
+
+class CalendarManager:
+    """Owns calendar sync: periodic refresh, background fetch, and applying results to state."""
+
+    def __init__(self, app: "LiquidMemoApp") -> None:
+        self.app = app
+        self._running = False
+        self._signals: _CalendarSyncSignals | None = None
+        self._timer = QTimer()
+        self._timer.setInterval(CALENDAR_SYNC_INTERVAL_MS)
+        self._timer.timeout.connect(self.sync_now)
+        # Coalesces rapid settings edits (typing a URL, nudging the day spinbox) into one sync.
+        self._debounce = QTimer()
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(500)
+        self._debounce.timeout.connect(self.sync_now)
+
+    def start(self) -> None:
+        if self.app.state.settings.calendarEnabled:
+            self._timer.start()
+            self.sync_now()
+
+    def on_settings_changed(self) -> None:
+        settings = self.app.state.settings
+        if settings.calendarEnabled and settings.calendarUrl.strip():
+            if not self._timer.isActive():
+                self._timer.start()
+            self._debounce.start()
+        else:
+            self._timer.stop()
+            self._debounce.stop()
+            self.app.window.refresh()  # hide the 日程 group when disabled / no URL
+
+    def sync_now(self) -> None:
+        settings = self.app.state.settings
+        if not settings.calendarEnabled or not settings.calendarUrl.strip() or self._running:
+            return
+        self._running = True
+        self.app.settings_window.refresh_calendar_status(syncing=True)
+        signals = _CalendarSyncSignals()
+        signals.finished.connect(self._on_finished)
+        signals.failed.connect(self._on_failed)
+        self._signals = signals  # keep a reference alive until the task completes
+        task = _CalendarSyncTask(settings.calendarUrl, settings.calendarSyncDays, signals)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_finished(self, events: list[CalendarEvent]) -> None:
+        self._running = False
+        self.app.state.calendarEvents = events
+        self.app.state.calendarLastSync = utc_now()
+        self.app.state.calendarLastError = None
+        self._prune_done_keys()
+        self.app.save()
+        self.app.window.refresh()
+        self.app.settings_window.refresh_calendar_status()
+
+    def _on_failed(self, message: str) -> None:
+        self._running = False
+        self.app.state.calendarLastError = message
+        self.app.save_later()
+        self.app.settings_window.refresh_calendar_status()
+
+    def _prune_done_keys(self) -> None:
+        # Keep only keys still present in the freshly synced window; past, dropped occurrences
+        # fall out so the done set cannot grow without bound.
+        valid = {event.key for event in self.app.state.calendarEvents}
+        self.app.state.calendarDoneKeys = [key for key in self.app.state.calendarDoneKeys if key in valid]
+
+    def toggle_event_done(self, key: str, checked: bool) -> None:
+        keys = self.app.state.calendarDoneKeys
+        if checked and key not in keys:
+            keys.append(key)
+        elif not checked and key in keys:
+            keys.remove(key)
+        self.app.save()
+        self.app.window.refresh()
+
+
 class LiquidMemoApp:
     def __init__(self) -> None:
         self.qt = QApplication(sys.argv)
@@ -1492,6 +2626,7 @@ class LiquidMemoApp:
         self.window = MemoWindow(self)
         self.settings_window = SettingsWindow(self)
         self.history_window = HistoryWindow(self)
+        self.calendar = CalendarManager(self)
         self.tray_menu: QMenu | None = None
         self.tray = QSystemTrayIcon(tray_icon())
         self.tray.setToolTip("桌面备忘")
@@ -1503,6 +2638,8 @@ class LiquidMemoApp:
         # showEvent already drives the initial geometry/refresh/recolor sequence; scheduling
         # it again here only rebuilt the list and recolored it a second time.
         self.window.show()
+        # Kick off the first calendar sync once the event loop is about to run.
+        QTimer.singleShot(0, self.calendar.start)
         return self.qt.exec()
 
     def save_later(self) -> None:
@@ -1630,6 +2767,10 @@ class LiquidMemoApp:
 
     def shutdown(self) -> None:
         self.save()
+        try:
+            self.window._wheel_hook.uninstall()
+        except Exception:
+            pass
         try:
             self.window.cleanup()
         except Exception:

@@ -90,3 +90,24 @@ def detach_from_parent(hwnd: int) -> None:
 def begin_system_move(hwnd: int) -> None:
     ReleaseCapture()
     SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)
+
+
+# DWM rounded-corner preference (Win11+). Used by the acrylic skin to round the frosted
+# window without an SDF; a no-op (ignored error) on Win10 and earlier.
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWCP_DEFAULT = 0
+DWMWCP_DONOTROUND = 1
+DWMWCP_ROUND = 2
+
+
+def set_rounded_corners(hwnd: int, rounded: bool = True) -> None:
+    preference = ctypes.c_int(DWMWCP_ROUND if rounded else DWMWCP_DONOTROUND)
+    try:
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd),
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(preference),
+            ctypes.sizeof(preference),
+        )
+    except Exception:
+        pass
