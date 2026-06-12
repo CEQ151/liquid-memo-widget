@@ -26,6 +26,12 @@ pythonw .\RunLiquidMemoWidget.pyw
 .\Package.ps1 -Version 0.0.1 -SkipInstaller   # zip only
 ```
 
+**PyInstaller pitfall:** app sources under `LiquidMemoWidget/` ship via `--add-data` and are
+imported only at runtime, so PyInstaller never analyzes their imports. Any new stdlib or
+third-party module imported there must also be added to `Build.ps1` as `--hidden-import`
+(this shipped a launch crash once: `xml.etree` was missing). Smoke-test
+`dist\LiquidMemoWidget\LiquidMemoWidget.exe` after changing imports.
+
 There are **no automated tests and no linter configured**. `one_d3d_widget.py` has a manual
 `__main__` smoke-test entry that renders a standalone glass square. Releases are produced by
 `.github/workflows/release.yml`, triggered by pushing a `v*` tag. **Before tagging a release:**
