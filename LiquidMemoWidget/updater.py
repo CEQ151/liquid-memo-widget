@@ -7,6 +7,7 @@ Pure network/process logic with no Qt dependency; the UI lives in app.py
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -175,17 +176,35 @@ def install_and_restart(installer: Path) -> None:
     """Run the Inno installer silently after this process exits, then relaunch.
 
     The helper PowerShell child survives our exit (Windows children are not
-    killed with the parent); the 2s sleep lets the app fully quit so the
-    installer can replace files. The caller must quit immediately after.
+    killed with the parent). Robustness against the previously shipped races:
+    - waits for this exact PID to terminate (no fixed sleep) so the installer
+      never starts while the app is still shutting down and holding file locks;
+    - /FORCECLOSEAPPLICATIONS + /SUPPRESSMSGBOXES stop Inno from popping error
+      dialogs if something still holds a file, /NORESTARTAPPLICATIONS stops the
+      restart manager from relaunching the app a second time (the helper owns
+      the relaunch);
+    - the relaunch lives in `finally`, so the app comes back even when the
+      install fails or the UAC prompt is declined;
+    - /LOG writes a diagnosis trail to %TEMP% for postmortems.
+
+    The caller must quit immediately after.
     """
     exe = sys.executable
     quoted_installer = str(installer).replace("'", "''")
     quoted_exe = exe.replace("'", "''")
+    log_path = Path(tempfile.gettempdir()) / "LiquidMemoWidget-update.log"
+    quoted_log = str(log_path).replace("'", "''")
     script = (
-        "Start-Sleep -Seconds 2; "
-        f"Start-Process -FilePath '{quoted_installer}' "
-        "-ArgumentList '/SILENT','/NORESTART' -Wait; "
-        f"Start-Process -FilePath '{quoted_exe}'"
+        f"Wait-Process -Id {os.getpid()} -Timeout 30 -ErrorAction SilentlyContinue; "
+        "Start-Sleep -Milliseconds 500; "
+        "try { "
+        f"Start-Process -FilePath '{quoted_installer}' -ArgumentList "
+        "'/SILENT','/NORESTART','/SUPPRESSMSGBOXES','/FORCECLOSEAPPLICATIONS',"
+        # Embedded quotes: PowerShell 5.1 joins ArgumentList without quoting, and
+        # Inno aborts when the /LOG file path (which breaks on a space) is invalid.
+        f"'/NORESTARTAPPLICATIONS','/LOG=\"{quoted_log}\"' -Wait "
+        "} catch {} finally { "
+        f"Start-Process -FilePath '{quoted_exe}' }}"
     )
     subprocess.Popen(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",

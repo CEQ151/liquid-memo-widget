@@ -27,6 +27,11 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; Auto-update runs this installer silently while the app may still be closing:
+; force-close anything holding our files instead of erroring, and never let the
+; restart manager relaunch the app itself - the updater helper owns the relaunch.
+CloseApplications=force
+RestartApplications=no
 UninstallDisplayIcon={app}\{#AppExeName}
 SetupIconFile=..\assets\logo.ico
 
