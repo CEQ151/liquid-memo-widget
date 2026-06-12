@@ -22,6 +22,7 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QRect,
     QRunnable,
+    QSize,
     Qt,
     QThreadPool,
     QTimer,
@@ -39,10 +40,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QMenu,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -63,9 +67,12 @@ from qfluentwidgets import (
     Slider,
     SmoothScrollArea,
     SpinBox,
-    SubtitleLabel,
     SwitchButton,
     TitleLabel,
+    ToolTipFilter,
+    ToolTipPosition,
+    TransparentToolButton,
+    setCustomStyleSheet,
     setTheme,
     Theme,
 )
@@ -804,28 +811,60 @@ class EditDDLPopup(QDialog):
         self.hide()
 
 
+SETTING_CONTROL_FONT_PX = 16
+
+
+def enlarge_control_font(widget: QWidget, px: int = SETTING_CONTROL_FONT_PX) -> None:
+    # qfluentwidgets controls hardcode `font: 14px` in their own QSS, which beats setFont;
+    # appending custom QSS via setCustomStyleSheet is the supported override path. The
+    # selector must be the widget's class name — a universal `*` rule loses to the default
+    # type selectors on specificity.
+    name = type(widget).__name__
+    font = f"font: {px}px 'Times New Roman','Microsoft YaHei','Segoe UI Emoji';"
+    qss = f"{name} {{ {font} }} {name} * {{ {font} }} {name} QLabel {{ {font} }}"
+    setCustomStyleSheet(widget, qss, qss)
+
+
+class InfoToolTipFilter(ToolTipFilter):
+    """ToolTipFilter whose bubble text is larger than the 12px qfluentwidgets default."""
+
+    def _createToolTip(self):
+        tip = super()._createToolTip()
+        tip.label.setStyleSheet(
+            f"{FONT_STACK_QSS} font-size: 16px; color: rgb(24, 32, 40);"
+            " background: transparent; border: none;"
+        )
+        tip.label.adjustSize()
+        tip.adjustSize()
+        return tip
+
+
 class FluentSettingRow(CardWidget):
     def __init__(self, title: str, content: str, control: QWidget, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(78)
+        self.setMinimumHeight(66)
         self.setObjectName("fluentSettingRow")
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setContentsMargins(18, 10, 18, 10)
         layout.setSpacing(18)
 
-        text_layout = QVBoxLayout()
+        text_layout = QHBoxLayout()
         text_layout.setContentsMargins(0, 0, 0, 0)
-        text_layout.setSpacing(4)
+        text_layout.setSpacing(6)
 
         title_label = BodyLabel(title)
-        title_label.setFont(mixed_font(11, QFont.Bold))
-        content_label = QLabel(content)
-        content_label.setWordWrap(True)
-        content_label.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,145); font-size: 12px;")
-
+        title_label.setFont(mixed_font(13, QFont.DemiBold))
         text_layout.addWidget(title_label)
-        text_layout.addWidget(content_label)
+        if content:
+            info = TransparentToolButton(FluentIcon.INFO, self)
+            info.setFixedSize(26, 26)
+            info.setIconSize(QSize(16, 16))
+            info.setCursor(Qt.WhatsThisCursor)
+            info.setToolTip(content)
+            info.installEventFilter(InfoToolTipFilter(info, showDelay=200, position=ToolTipPosition.TOP))
+            text_layout.addWidget(info, 0, Qt.AlignVCenter)
+        text_layout.addStretch()
         layout.addLayout(text_layout, 1)
         layout.addWidget(control, 0, Qt.AlignVCenter)
 
@@ -1127,7 +1166,7 @@ class SettingsWindow(QDialog):
         self._last_startup_checked = is_startup_enabled()
         self.setWindowTitle("设置")
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(660, 720)
+        self.setFixedSize(960, 720)
         self._build()
 
     def _build(self) -> None:
@@ -1160,15 +1199,17 @@ class SettingsWindow(QDialog):
         titles.setSpacing(4)
         title = TitleLabel("设置")
         subtitle = BodyLabel("调整桌面备忘的玻璃、颜色、启动和窗口行为。")
-        subtitle.setStyleSheet("color: rgba(17,24,32,150);")
+        subtitle.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,150); font-size: 16px;")
         titles.addWidget(title)
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
         reset = PushButton("恢复默认", self.frame, FluentIcon.RETURN)
         reset.clicked.connect(self.reset_defaults)
+        enlarge_control_font(reset)
         header.addWidget(reset)
         close = PrimaryPushButton("完成", self.frame, FluentIcon.ACCEPT)
         close.clicked.connect(self._finish)
+        enlarge_control_font(close)
         header.addWidget(close)
         layout.addLayout(header)
 
@@ -1177,25 +1218,43 @@ class SettingsWindow(QDialog):
         divider.setStyleSheet("background: rgba(17,24,32,24); border: none;")
         layout.addWidget(divider)
 
-        self.scroll = SmoothScrollArea(self.frame)
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-        self.scroll.setStyleSheet(
-            """
-            QScrollArea { background: transparent; border: none; }
-            QScrollBar:vertical { width: 6px; background: transparent; margin: 2px; }
-            QScrollBar::handle:vertical { background: rgba(17,24,32,60); border-radius: 3px; min-height: 32px; }
-            QScrollBar::handle:vertical:hover { background: rgba(17,24,32,100); }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        body = QHBoxLayout()
+        body.setSpacing(18)
+        self.nav = QListWidget(self.frame)
+        self.nav.setFixedWidth(170)
+        self.nav.setFrameShape(QFrame.NoFrame)
+        self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nav.setStyleSheet(
+            f"""
+            QListWidget {{
+                {FONT_STACK_QSS}
+                background: transparent;
+                border: none;
+                outline: none;
+                font-size: 17px;
+            }}
+            QListWidget::item {{
+                color: rgb(24, 32, 40);
+                padding: 0px 14px;
+                margin: 2px 0px;
+                border-radius: 9px;
+            }}
+            QListWidget::item:hover {{
+                background: rgba(17, 24, 32, 14);
+            }}
+            QListWidget::item:selected {{
+                background: rgba(0, 103, 192, 30);
+                color: rgb(0, 71, 138);
+            }}
             """
         )
-        self.content = QWidget()
-        self.content.setStyleSheet("background: transparent;")
-        self.form = QVBoxLayout(self.content)
-        self.form.setContentsMargins(0, 0, 8, 0)
-        self.form.setSpacing(10)
-        self.scroll.setWidget(self.content)
-        layout.addWidget(self.scroll, 1)
+        self.stack = QStackedWidget(self.frame)
+        self.stack.setStyleSheet("background: transparent;")
+        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        body.addWidget(self.nav)
+        body.addWidget(self.stack, 1)
+        layout.addLayout(body, 1)
+        self.form: QVBoxLayout | None = None
 
         self._section("外观")
         self.skin = self._combo_row(
@@ -1251,24 +1310,44 @@ class SettingsWindow(QDialog):
 
         self._section("关于")
         github_link = HyperlinkButton(GITHUB_URL, "GitHub 仓库", None, FluentIcon.GITHUB)
+        enlarge_control_font(github_link)
         self.form.addWidget(FluentSettingRow("项目主页", "查看源码、提交反馈或为项目点个 Star。", github_link))
         self._update_row()
 
         self.form.addStretch()
+        self.nav.setCurrentRow(0)
 
     def _section(self, title: str) -> None:
-        label = SubtitleLabel(title)
-        label.setContentsMargins(0, 10, 0, 2)
-        # A thin accent bar to the left of each section header for a cleaner Fluent rhythm.
-        label.setStyleSheet(
-            f"{FONT_STACK_QSS} color: rgb(15, 24, 32);"
-            " padding-left: 12px; border-left: 3px solid #0067C0;"
+        # Each section becomes a nav entry + its own scrollable page; the row helpers
+        # keep appending to self.form, which now points at the newest page's layout.
+        if self.form is not None:
+            self.form.addStretch()
+        scroll = SmoothScrollArea(self.stack)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(
+            """
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical { width: 6px; background: transparent; margin: 2px; }
+            QScrollBar::handle:vertical { background: rgba(17,24,32,60); border-radius: 3px; min-height: 32px; }
+            QScrollBar::handle:vertical:hover { background: rgba(17,24,32,100); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            """
         )
-        self.form.addWidget(label)
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        self.form = QVBoxLayout(page)
+        self.form.setContentsMargins(0, 2, 8, 2)
+        self.form.setSpacing(10)
+        scroll.setWidget(page)
+        self.stack.addWidget(scroll)
+        item = QListWidgetItem(title)
+        item.setSizeHint(QSize(0, 46))
+        self.nav.addItem(item)
 
     def _slider_row(self, title: str, content: str, value: int, minimum: int, maximum: int, suffix: str) -> tuple[Slider, BodyLabel]:
         control = QWidget()
-        control.setFixedWidth(250)
+        control.setFixedWidth(280)
         layout = QHBoxLayout(control)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
@@ -1277,7 +1356,8 @@ class SettingsWindow(QDialog):
         slider.setValue(value)
         slider.setThemeColor("#0067C0", "#4CC2FF")
         value_label = BodyLabel(f"{value}{suffix}")
-        value_label.setFixedWidth(48)
+        value_label.setFont(mixed_font(12))
+        value_label.setFixedWidth(58)
         value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(slider, 1)
         layout.addWidget(value_label)
@@ -1292,15 +1372,16 @@ class SettingsWindow(QDialog):
         control = QWidget()
         control.setProperty("selectedColor", color)
         control.setProperty("activatesManualTextColor", activates_manual_text_color)
-        control.setFixedWidth(220)
+        control.setFixedWidth(250)
         layout = QHBoxLayout(control)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         swatch = QFrame()
         swatch.setObjectName("colorSwatch")
-        swatch.setFixedSize(28, 28)
+        swatch.setFixedSize(30, 30)
         button = PushButton(color, control, FluentIcon.PALETTE)
-        button.setFixedWidth(170)
+        button.setFixedWidth(195)
+        enlarge_control_font(button)
         button.clicked.connect(lambda: self._pick_color(control, swatch, button, title))
         layout.addWidget(swatch)
         layout.addWidget(button, 1)
@@ -1315,7 +1396,8 @@ class SettingsWindow(QDialog):
 
     def _combo_row(self, title: str, content: str, options: dict[str, str], current: str) -> ComboBox:
         combo = ComboBox()
-        combo.setFixedWidth(240)
+        combo.setFixedWidth(280)
+        enlarge_control_font(combo)
         for text, data in options.items():
             combo.addItem(text, userData=data)
         index = combo.findData(current)
@@ -1326,12 +1408,21 @@ class SettingsWindow(QDialog):
     def _switch_row(self, title: str, content: str, checked: bool) -> SwitchButton:
         switch = SwitchButton()
         switch.setChecked(checked)
+        enlarge_control_font(switch)
+        # The On/Off label carries its own copy of switch_button.qss, which shadows
+        # rules set on the SwitchButton itself.
+        label_qss = (
+            f"SwitchButton>QLabel {{ font: {SETTING_CONTROL_FONT_PX}px"
+            " 'Times New Roman','Microsoft YaHei','Segoe UI Emoji'; }"
+        )
+        setCustomStyleSheet(switch.label, label_qss, label_qss)
         self.form.addWidget(FluentSettingRow(title, content, switch))
         return switch
 
     def _lineedit_row(self, title: str, content: str, value: str, placeholder: str) -> LineEdit:
         edit = LineEdit()
-        edit.setFixedWidth(300)
+        edit.setFixedWidth(340)
+        enlarge_control_font(edit)
         edit.setText(value)
         edit.setPlaceholderText(placeholder)
         edit.setClearButtonEnabled(True)
@@ -1342,21 +1433,23 @@ class SettingsWindow(QDialog):
         spin = SpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
-        spin.setFixedWidth(120)
+        spin.setFixedWidth(140)
+        enlarge_control_font(spin)
         self.form.addWidget(FluentSettingRow(title, content, spin))
         return spin
 
     def _calendar_status_row(self) -> None:
         control = QWidget()
-        control.setFixedWidth(300)
+        control.setFixedWidth(340)
         layout = QHBoxLayout(control)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         self.calendar_status_label = BodyLabel("")
         self.calendar_status_label.setWordWrap(True)
-        self.calendar_status_label.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,150); font-size: 12px;")
+        self.calendar_status_label.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,150); font-size: 14px;")
         sync_button = PushButton("立即同步")
         sync_button.clicked.connect(self._sync_calendar_now)
+        enlarge_control_font(sync_button)
         layout.addWidget(self.calendar_status_label, 1)
         layout.addWidget(sync_button)
         self.form.addWidget(FluentSettingRow("同步状态", "手动触发一次同步，或查看上次结果。", control))
@@ -1364,15 +1457,16 @@ class SettingsWindow(QDialog):
 
     def _update_row(self) -> None:
         control = QWidget()
-        control.setFixedWidth(300)
+        control.setFixedWidth(340)
         layout = QHBoxLayout(control)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         self.update_status_label = BodyLabel(f"当前版本 v{APP_VERSION}")
         self.update_status_label.setWordWrap(True)
-        self.update_status_label.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,150); font-size: 12px;")
+        self.update_status_label.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,150); font-size: 14px;")
         check_button = PushButton("检查更新", control, FluentIcon.SYNC)
         check_button.clicked.connect(lambda: self.app.updater.check(silent=False))
+        enlarge_control_font(check_button)
         layout.addWidget(self.update_status_label, 1)
         layout.addWidget(check_button)
         self.form.addWidget(FluentSettingRow("检查更新", "从 GitHub Releases 获取新版本，自动下载并安装。", control))
@@ -3003,11 +3097,11 @@ class LiquidMemoApp:
                 border: 1px solid rgba(17,24,32,26);
                 border-radius: 15px;
                 padding: 8px;
-                font-size: 15px;
+                font-size: 17px;
             }}
             QMenu::item {{
                 min-width: 224px;
-                min-height: 40px;
+                min-height: 44px;
                 padding: 9px 26px 9px 18px;
                 margin: 2px 4px;
                 border-radius: 10px;
