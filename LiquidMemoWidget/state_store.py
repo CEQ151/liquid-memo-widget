@@ -105,6 +105,26 @@ class WindowState:
 
 
 @dataclass
+class CalendarFeed:
+    """One ICS/webcal subscription. `enabled` is the per-calendar checkbox: only checked
+    feeds are synced and have their events shown in the memo window."""
+
+    id: str = field(default_factory=lambda: str(uuid4()))
+    url: str = ""
+    name: str = ""  # auto-filled from the feed's X-WR-CALNAME on sync; falls back to the URL
+    enabled: bool = True
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "CalendarFeed":
+        return CalendarFeed(
+            id=str(data.get("id") or uuid4()),
+            url=str(data.get("url") or ""),
+            name=str(data.get("name") or ""),
+            enabled=bool(data.get("enabled", True)),
+        )
+
+
+@dataclass
 class Settings:
     # Rendering skin. "acrylic" is a lightweight DWM frosted-glass surface (no GPU screen
     # capture) for low-end PCs and is the default; "glass" is the original real-time D3D
@@ -123,13 +143,19 @@ class Settings:
     # (leaving a thin peek strip) until the cursor returns to that strip.
     edgeAutoHide: bool = True
     # Calendar subscription: when enabled, the widget syncs the next `calendarSyncDays` days of
-    # events from an ICS/webcal URL and shows them in a separate "日程" group.
+    # events from the checked ICS/webcal feeds and shows them in a separate "日程" group.
+    # Deleted feeds move to `calendarFeedArchive` so an accidental deletion can be restored.
     calendarEnabled: bool = False
-    calendarUrl: str = ""
+    calendarFeeds: list[CalendarFeed] = field(default_factory=list)
+    calendarFeedArchive: list[CalendarFeed] = field(default_factory=list)
     calendarSyncDays: int = 7
     # Version of the app on its previous run; when it differs from the current
     # APP_VERSION the app shows the new version's changelog once after an update.
     lastRunVersion: str = ""
+
+    def active_calendar_feeds(self) -> list[CalendarFeed]:
+        """Feeds that are checked and have a URL — the only ones synced and displayed."""
+        return [feed for feed in self.calendarFeeds if feed.enabled and feed.url.strip()]
 
 
 @dataclass
@@ -139,8 +165,10 @@ class CalendarEvent:
     start: str = ""  # ISO local datetime (or date for all-day)
     allDay: bool = False
     # Stable identity for one occurrence (a recurring series yields one key per instance), used
-    # to remember which events the user checked off across re-syncs.
+    # to remember which events the user checked off across re-syncs. Feed-scoped, so the same
+    # event arriving from two subscriptions cannot collide.
     key: str = ""
+    feedId: str = ""  # owning CalendarFeed.id; display filters on the feed's checkbox
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "CalendarEvent":
@@ -152,12 +180,13 @@ class CalendarEvent:
             start=start,
             allDay=bool(data.get("allDay", False)),
             key=str(data.get("key") or f"{uid}|{start}"),
+            feedId=str(data.get("feedId") or ""),
         )
 
 
 @dataclass
 class AppState:
-    version: int = 3
+    version: int = 4
     settings: Settings = field(default_factory=Settings)
     window: WindowState = field(default_factory=WindowState)
     todos: list[TodoItem] = field(default_factory=list)
@@ -180,13 +209,27 @@ class AppState:
         if settings.skin not in ("acrylic", "glass"):
             settings.skin = "acrylic"
         settings.calendarSyncDays = max(1, min(30, int(settings.calendarSyncDays or 7)))
+        # The generic loop above leaves dataclass lists as raw dicts; rebuild them typed.
+        settings.calendarFeeds = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeeds") or []]
+        settings.calendarFeedArchive = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeedArchive") or []]
         window = WindowState(**{key: window_data.get(key, value) for key, value in window_defaults.items()})
         todos = [TodoItem.from_dict(item) for item in data.get("todos") or []]
         history = [TodoItem.from_dict(item) for item in data.get("history") or []]
         events = [CalendarEvent.from_dict(item) for item in data.get("calendarEvents") or []]
         done_keys = [str(key) for key in data.get("calendarDoneKeys") or []]
+        # v3 -> v4 migration: the single `calendarUrl` string becomes the first feed; cached
+        # events and done-keys are retagged to the new feed-scoped identity so nothing is lost.
+        legacy_url = str(settings_data.get("calendarUrl") or "").strip()
+        if legacy_url and not settings.calendarFeeds:
+            feed = CalendarFeed(url=legacy_url)
+            settings.calendarFeeds = [feed]
+            for event in events:
+                if not event.feedId:
+                    event.feedId = feed.id
+                    event.key = f"{feed.id}|{event.key}"
+            done_keys = [f"{feed.id}|{key}" for key in done_keys]
         return AppState(
-            version=3,
+            version=4,
             settings=settings,
             window=window,
             todos=todos,

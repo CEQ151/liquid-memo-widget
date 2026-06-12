@@ -56,6 +56,7 @@ from qfluentwidgets import (
     Action,
     BodyLabel,
     CardWidget,
+    CheckBox,
     ColorDialog,
     ComboBox,
     FluentIcon,
@@ -64,6 +65,7 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
+    RoundMenu,
     Slider,
     SmoothScrollArea,
     SpinBox,
@@ -90,7 +92,7 @@ from WindowsLiquidGlass.src.GPUSharderWidget.one_d3d_widget import (  # noqa: E4
 
 from liquid_effects import build_effect_params, color_overlay_strength
 from startup import is_startup_enabled, set_startup
-from state_store import AppState, CalendarEvent, Settings, StateStore, TodoItem, parse_ddl, utc_now
+from state_store import AppState, CalendarEvent, CalendarFeed, Settings, StateStore, TodoItem, parse_ddl, utc_now
 import calendar_sync
 import updater
 from version import APP_VERSION, GITHUB_URL
@@ -1159,7 +1161,35 @@ class ChangelogDialog(_ReleaseCardDialog):
         self.body.addLayout(buttons)
 
 
-class SettingsWindow(QDialog):
+class FramelessDragMixin:
+    """Click-drag a frameless dialog by any spot no child widget consumes (header, gaps).
+
+    Non-interactive children (labels, frames) ignore mouse presses, so the press
+    propagates up to the dialog; interactive controls keep working untouched.
+    """
+
+    _drag_offset: QPoint | None = None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_offset is not None and (event.buttons() & Qt.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class SettingsWindow(FramelessDragMixin, QDialog):
     def __init__(self, app: "LiquidMemoApp") -> None:
         super().__init__(None, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.app = app
@@ -1203,7 +1233,9 @@ class SettingsWindow(QDialog):
         titles.addWidget(title)
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
-        reset = PushButton("恢复默认", self.frame, FluentIcon.RETURN)
+        reset = PushButton("恢复默认外观", self.frame, FluentIcon.RETURN)
+        reset.setToolTip("仅恢复「外观」分类的默认值，不影响行为与日历订阅设置")
+        reset.installEventFilter(ToolTipFilter(reset, showDelay=300, position=ToolTipPosition.BOTTOM))
         reset.clicked.connect(self.reset_defaults)
         enlarge_control_font(reset)
         header.addWidget(reset)
@@ -1294,14 +1326,10 @@ class SettingsWindow(QDialog):
 
         self._section("日历订阅")
         self.calendar_enabled = self._switch_row(
-            "启用日历订阅", "开启后自动同步 ICS / webcal 日历链接中近 N 天的日程。", self.app.state.settings.calendarEnabled
+            "启用日历订阅", "开启后自动同步勾选的日历订阅中近 N 天的日程。", self.app.state.settings.calendarEnabled
         )
         self.calendar_enabled.checkedChanged.connect(lambda _checked: self._apply())
-        self.calendar_url = self._lineedit_row(
-            "订阅链接", "粘贴 Google / Outlook / Apple 的 ICS 或 webcal 日历地址。",
-            self.app.state.settings.calendarUrl, "https://… .ics 或 webcal://…",
-        )
-        self.calendar_url.editingFinished.connect(self._apply)
+        self._feeds_card()
         self.calendar_days = self._spinbox_row(
             "同步未来天数", "只同步从今天起这么多天内的日程。", self.app.state.settings.calendarSyncDays, 1, 30
         )
@@ -1419,15 +1447,168 @@ class SettingsWindow(QDialog):
         self.form.addWidget(FluentSettingRow(title, content, switch))
         return switch
 
-    def _lineedit_row(self, title: str, content: str, value: str, placeholder: str) -> LineEdit:
-        edit = LineEdit()
-        edit.setFixedWidth(340)
-        enlarge_control_font(edit)
-        edit.setText(value)
-        edit.setPlaceholderText(placeholder)
-        edit.setClearButtonEnabled(True)
-        self.form.addWidget(FluentSettingRow(title, content, edit))
-        return edit
+    def _feeds_card(self) -> None:
+        """Subscription list: one checkbox row per calendar (checked = shown in the memo
+        window), delete moves a feed to the archive, and the archive can be restored."""
+        card = CardWidget()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 12, 18, 14)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        title = BodyLabel("订阅的日历")
+        title.setFont(mixed_font(13, QFont.DemiBold))
+        header.addWidget(title)
+        info = TransparentToolButton(FluentIcon.INFO, card)
+        info.setFixedSize(26, 26)
+        info.setIconSize(QSize(16, 16))
+        info.setCursor(Qt.WhatsThisCursor)
+        info.setToolTip(
+            "粘贴 Google / Outlook / Apple 的 ICS 或 webcal 日历地址，可添加多个订阅；"
+            "只有勾选的日历会在备忘录窗口中展示。删除的链接会自动存档，可从「恢复已删除」找回。"
+        )
+        info.installEventFilter(InfoToolTipFilter(info, showDelay=200, position=ToolTipPosition.TOP))
+        header.addWidget(info)
+        header.addStretch()
+        self.feed_restore_button = PushButton("恢复已删除", card, FluentIcon.HISTORY)
+        enlarge_control_font(self.feed_restore_button)
+        self.feed_restore_button.clicked.connect(self._show_restore_menu)
+        header.addWidget(self.feed_restore_button)
+        layout.addLayout(header)
+
+        self.feed_rows_layout = QVBoxLayout()
+        self.feed_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.feed_rows_layout.setSpacing(2)
+        layout.addLayout(self.feed_rows_layout)
+
+        add_row = QHBoxLayout()
+        add_row.setSpacing(10)
+        self.feed_input = LineEdit()
+        self.feed_input.setPlaceholderText("https://… .ics 或 webcal://…")
+        self.feed_input.setClearButtonEnabled(True)
+        enlarge_control_font(self.feed_input)
+        self.feed_input.returnPressed.connect(self._add_feed)
+        add_button = PushButton("添加", card, FluentIcon.ADD)
+        enlarge_control_font(add_button)
+        add_button.clicked.connect(self._add_feed)
+        add_row.addWidget(self.feed_input, 1)
+        add_row.addWidget(add_button)
+        layout.addLayout(add_row)
+
+        self.form.addWidget(card)
+        self.refresh_feed_list()
+
+    @staticmethod
+    def _feed_label(feed: CalendarFeed) -> str:
+        text = feed.name or feed.url
+        return text if len(text) <= 46 else text[:45] + "…"
+
+    def refresh_feed_list(self) -> None:
+        if not hasattr(self, "feed_rows_layout"):
+            return
+        while self.feed_rows_layout.count():
+            item = self.feed_rows_layout.takeAt(0)
+            if item.widget():
+                item.widget().hide()  # deleteLater is deferred; hide now so rows never overlap
+                item.widget().deleteLater()
+        settings = self.app.state.settings
+        if not settings.calendarFeeds:
+            empty = BodyLabel("尚未添加日历订阅")
+            empty.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,120); font-size: 14px;")
+            self.feed_rows_layout.addWidget(empty)
+        for feed in settings.calendarFeeds:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            box = CheckBox(self._feed_label(feed))
+            box.setChecked(feed.enabled)
+            enlarge_control_font(box)
+            box.setToolTip(feed.url)
+            box.installEventFilter(InfoToolTipFilter(box, showDelay=400, position=ToolTipPosition.TOP))
+            box.toggled.connect(lambda checked, fid=feed.id: self._toggle_feed(fid, checked))
+            remove = TransparentToolButton(FluentIcon.DELETE, row)
+            remove.setFixedSize(28, 28)
+            remove.setIconSize(QSize(15, 15))
+            remove.setToolTip("删除此订阅（可从「恢复已删除」找回）")
+            remove.installEventFilter(ToolTipFilter(remove, showDelay=300, position=ToolTipPosition.TOP))
+            remove.clicked.connect(lambda _checked=False, fid=feed.id: self._delete_feed(fid))
+            row_layout.addWidget(box, 1)
+            row_layout.addWidget(remove)
+            self.feed_rows_layout.addWidget(row)
+        self.feed_restore_button.setVisible(bool(settings.calendarFeedArchive))
+
+    def _feeds_changed(self) -> None:
+        self.refresh_feed_list()
+        self.app.save()
+        self.app.calendar.on_settings_changed()
+
+    def _add_feed(self) -> None:
+        url = self.feed_input.text().strip()
+        if not url:
+            return
+        settings = self.app.state.settings
+        if any(feed.url == url for feed in settings.calendarFeeds):
+            self.feed_input.clear()
+            return
+        archived = next((feed for feed in settings.calendarFeedArchive if feed.url == url), None)
+        if archived:
+            settings.calendarFeedArchive.remove(archived)
+            archived.enabled = True
+            settings.calendarFeeds.append(archived)
+        else:
+            settings.calendarFeeds.append(CalendarFeed(url=url))
+        self.feed_input.clear()
+        self._feeds_changed()
+
+    def _delete_feed(self, feed_id: str) -> None:
+        settings = self.app.state.settings
+        feed = next((feed for feed in settings.calendarFeeds if feed.id == feed_id), None)
+        if feed is None:
+            return
+        settings.calendarFeeds.remove(feed)
+        # Archive it (dedupe by URL, newest first, bounded) so deletion is recoverable.
+        settings.calendarFeedArchive = [f for f in settings.calendarFeedArchive if f.url != feed.url]
+        settings.calendarFeedArchive.insert(0, feed)
+        del settings.calendarFeedArchive[12:]
+        state = self.app.state
+        state.calendarEvents = [event for event in state.calendarEvents if event.feedId != feed_id]
+        state.calendarDoneKeys = [key for key in state.calendarDoneKeys if not key.startswith(feed_id + "|")]
+        self._feeds_changed()
+
+    def _toggle_feed(self, feed_id: str, checked: bool) -> None:
+        settings = self.app.state.settings
+        feed = next((feed for feed in settings.calendarFeeds if feed.id == feed_id), None)
+        if feed is None or feed.enabled == checked:
+            return
+        feed.enabled = checked
+        self.app.save()
+        self.app.calendar.on_settings_changed()
+
+    def _show_restore_menu(self) -> None:
+        settings = self.app.state.settings
+        if not settings.calendarFeedArchive:
+            return
+        menu = RoundMenu(parent=self)
+        for feed in list(settings.calendarFeedArchive):
+            action = Action(FluentIcon.CALENDAR, self._feed_label(feed), menu)
+            action.triggered.connect(lambda _checked=False, fid=feed.id: self._restore_feed(fid))
+            menu.addAction(action)
+        menu.exec(self.feed_restore_button.mapToGlobal(
+            QPoint(0, self.feed_restore_button.height() + 4)
+        ))
+
+    def _restore_feed(self, feed_id: str) -> None:
+        settings = self.app.state.settings
+        feed = next((feed for feed in settings.calendarFeedArchive if feed.id == feed_id), None)
+        if feed is None:
+            return
+        settings.calendarFeedArchive.remove(feed)
+        if not any(existing.url == feed.url for existing in settings.calendarFeeds):
+            feed.enabled = True
+            settings.calendarFeeds.append(feed)
+        self._feeds_changed()
 
     def _spinbox_row(self, title: str, content: str, value: int, minimum: int, maximum: int) -> SpinBox:
         spin = SpinBox()
@@ -1535,7 +1716,6 @@ class SettingsWindow(QDialog):
             self.startup.blockSignals(True),
             self.edge_autohide.blockSignals(True),
             self.calendar_enabled.blockSignals(True),
-            self.calendar_url.blockSignals(True),
             self.calendar_days.blockSignals(True),
         ]
         self.skin.setCurrentIndex(max(0, self.skin.findData(settings.skin)))
@@ -1553,12 +1733,12 @@ class SettingsWindow(QDialog):
         self.startup.setChecked(self._last_startup_checked)
         self.edge_autohide.setChecked(settings.edgeAutoHide)
         self.calendar_enabled.setChecked(settings.calendarEnabled)
-        self.calendar_url.setText(settings.calendarUrl)
         self.calendar_days.setValue(settings.calendarSyncDays)
+        self.refresh_feed_list()
         self.refresh_calendar_status()
         for widget, blocked in zip(
             [self.skin, self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup,
-             self.edge_autohide, self.calendar_enabled, self.calendar_url, self.calendar_days],
+             self.edge_autohide, self.calendar_enabled, self.calendar_days],
             blockers,
         ):
             widget.blockSignals(blocked)
@@ -1574,12 +1754,20 @@ class SettingsWindow(QDialog):
         self.hide()
 
     def reset_defaults(self) -> None:
-        self.app.state.settings = Settings()
-        set_startup(False)
-        self._last_startup_checked = False
+        # Appearance only. Behavior, startup and the calendar subscription must survive a
+        # reset — wiping the whole Settings() used to silently disable and clear the user's
+        # calendar feeds.
+        defaults = Settings()
+        settings = self.app.state.settings
+        settings.skin = defaults.skin
+        settings.glassOpacity = defaults.glassOpacity
+        settings.liquidStrength = defaults.liquidStrength
+        settings.windowTint = defaults.windowTint
+        settings.todoTextColor = defaults.todoTextColor
+        settings.urgentTextColor = defaults.urgentTextColor
+        settings.fontColorMode = defaults.fontColorMode
         self.sync_from_state()
         self._apply(save_now=True)
-        self.app.calendar.on_settings_changed()  # stop syncing + hide 日程 group on reset
         # _apply already drove the skin transition; only the glass pipeline needs a hard reset
         # (the acrylic skin runs no capture loop, so resetting it would only spin a no-op timer).
         if self.app.state.settings.skin == "glass":
@@ -1608,11 +1796,11 @@ class SettingsWindow(QDialog):
             self._last_startup_checked = startup_checked
 
         # Calendar: detect a change so we only (re)sync when the subscription actually changes.
-        calendar_before = (settings.calendarEnabled, settings.calendarUrl, settings.calendarSyncDays)
+        # (Feed add/delete/toggle bypasses _apply and calls on_settings_changed directly.)
+        calendar_before = (settings.calendarEnabled, settings.calendarSyncDays)
         settings.calendarEnabled = self.calendar_enabled.isChecked()
-        settings.calendarUrl = self.calendar_url.text().strip()
         settings.calendarSyncDays = int(self.calendar_days.value())
-        calendar_changed = calendar_before != (settings.calendarEnabled, settings.calendarUrl, settings.calendarSyncDays)
+        calendar_changed = calendar_before != (settings.calendarEnabled, settings.calendarSyncDays)
 
         if save_now:
             self.app.save()
@@ -2438,9 +2626,12 @@ class MemoWindow(OneGPUWidget):
         # Synced events are read-only and never archive to history (they would just re-sync),
         # so unlike todos they ignore completeBehavior: checking one only dims + strikes it
         # through in place and it stays visible until it drops out of the sync window.
-        if not self.app.state.settings.calendarEnabled:
+        # Only events of checked feeds show; unchecked feeds keep their cache hidden.
+        settings = self.app.state.settings
+        if not settings.calendarEnabled:
             return []
-        return list(self.app.state.calendarEvents)
+        visible = {feed.id for feed in settings.active_calendar_feeds()}
+        return [event for event in self.app.state.calendarEvents if event.feedId in visible]
 
     def _make_calendar_header(self) -> QLabel:
         header = QLabel("日程")
@@ -2817,26 +3008,44 @@ class MemoWindow(OneGPUWidget):
 
 
 class _CalendarSyncSignals(QObject):
-    finished = Signal(list)  # list[CalendarEvent]
-    failed = Signal(str)
+    # dict: {"events": list[CalendarEvent], "okIds": list[str], "names": dict[str, str],
+    #        "errors": list[str]} — partial failures carry both events and errors.
+    finished = Signal(dict)
 
 
 class _CalendarSyncTask(QRunnable):
-    """Fetch + parse on a thread-pool thread so the glass render loop never blocks."""
+    """Fetch + parse every checked feed on a pool thread so the render loop never blocks.
 
-    def __init__(self, url: str, days: int, signals: _CalendarSyncSignals) -> None:
+    One feed failing must not lose the others: each feed is fetched independently and the
+    result reports per-feed success (okIds) so the manager can keep cached events for the
+    feeds that failed this round.
+    """
+
+    def __init__(self, feeds: list[CalendarFeed], days: int, signals: _CalendarSyncSignals) -> None:
         super().__init__()
-        self.url = url
+        # Snapshot plain values; the live dataclasses belong to the UI thread.
+        self.feeds = [(feed.id, feed.url, feed.name) for feed in feeds]
         self.days = days
         self.signals = signals
 
     def run(self) -> None:
-        try:
-            text = calendar_sync.fetch_ics(self.url)
-            events = calendar_sync.parse_events(text, self.days, datetime.now())
-            self.signals.finished.emit(events)
-        except Exception as exc:  # network/parse errors are reported to the UI, not fatal
-            self.signals.failed.emit(str(exc) or exc.__class__.__name__)
+        events: list[CalendarEvent] = []
+        ok_ids: list[str] = []
+        names: dict[str, str] = {}
+        errors: list[str] = []
+        for feed_id, url, name in self.feeds:
+            try:
+                text = calendar_sync.fetch_ics(url)
+                feed_name, feed_events = calendar_sync.parse_feed(text, self.days, datetime.now(), feed_id)
+                events.extend(feed_events)
+                ok_ids.append(feed_id)
+                if feed_name:
+                    names[feed_id] = feed_name
+            except Exception as exc:  # network/parse errors are reported to the UI, not fatal
+                errors.append(f"{name or url}：{str(exc) or exc.__class__.__name__}")
+        self.signals.finished.emit(
+            {"events": events, "okIds": ok_ids, "names": names, "errors": errors}
+        )
 
 
 class CalendarManager:
@@ -2862,43 +3071,58 @@ class CalendarManager:
 
     def on_settings_changed(self) -> None:
         settings = self.app.state.settings
-        if settings.calendarEnabled and settings.calendarUrl.strip():
+        if settings.calendarEnabled and settings.active_calendar_feeds():
             if not self._timer.isActive():
                 self._timer.start()
             self._debounce.start()
+            # Show cached events of just-(re)enabled feeds immediately; the debounced sync
+            # then refreshes them from the network.
+            self.app.window.refresh()
         else:
             self._timer.stop()
             self._debounce.stop()
-            self.app.window.refresh()  # hide the 日程 group when disabled / no URL
+            self.app.window.refresh()  # hide the 日程 group when disabled / no checked feed
 
     def sync_now(self) -> None:
         settings = self.app.state.settings
-        if not settings.calendarEnabled or not settings.calendarUrl.strip() or self._running:
+        feeds = settings.active_calendar_feeds()
+        if not settings.calendarEnabled or not feeds or self._running:
             return
         self._running = True
         self.app.settings_window.refresh_calendar_status(syncing=True)
         signals = _CalendarSyncSignals()
         signals.finished.connect(self._on_finished)
-        signals.failed.connect(self._on_failed)
         self._signals = signals  # keep a reference alive until the task completes
-        task = _CalendarSyncTask(settings.calendarUrl, settings.calendarSyncDays, signals)
+        task = _CalendarSyncTask(feeds, settings.calendarSyncDays, signals)
         QThreadPool.globalInstance().start(task)
 
-    def _on_finished(self, events: list[CalendarEvent]) -> None:
+    def _on_finished(self, result: dict) -> None:
         self._running = False
-        self.app.state.calendarEvents = events
-        self.app.state.calendarLastSync = utc_now()
-        self.app.state.calendarLastError = None
+        state = self.app.state
+        settings = state.settings
+        synced_ok = set(result["okIds"])
+        feed_ids = {feed.id for feed in settings.calendarFeeds}
+        # Freshly synced feeds replace their cached events; feeds that failed this round or
+        # are unchecked keep their cache (hidden by the display filter, refreshed when they
+        # come back). Events of deleted feeds drop out here.
+        kept = [
+            event for event in state.calendarEvents
+            if event.feedId in feed_ids and event.feedId not in synced_ok
+        ]
+        state.calendarEvents = sorted(kept + result["events"], key=lambda event: event.start)
+        # Adopt calendar names advertised by the feeds (X-WR-CALNAME).
+        for feed in settings.calendarFeeds:
+            name = result["names"].get(feed.id)
+            if name and feed.name != name:
+                feed.name = name
+        if synced_ok:
+            state.calendarLastSync = utc_now()
+        state.calendarLastError = "；".join(result["errors"]) or None
         self._prune_done_keys()
         self.app.save()
         self.app.window.refresh()
         self.app.settings_window.refresh_calendar_status()
-
-    def _on_failed(self, message: str) -> None:
-        self._running = False
-        self.app.state.calendarLastError = message
-        self.app.save_later()
-        self.app.settings_window.refresh_calendar_status()
+        self.app.settings_window.refresh_feed_list()
 
     def _prune_done_keys(self) -> None:
         # Keep only keys still present in the freshly synced window; past, dropped occurrences

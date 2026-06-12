@@ -51,13 +51,20 @@ def _to_local(value: datetime | date) -> tuple[str, bool]:
     return value.strftime("%Y-%m-%d"), True
 
 
-def parse_events(ics_text: str, days: int, now: datetime | None = None) -> list[CalendarEvent]:
-    """Expand VEVENTs (incl. RRULE) falling within [now, now + days) into local-time events."""
+def parse_feed(ics_text: str, days: int, now: datetime | None = None,
+               feed_id: str = "") -> tuple[str, list[CalendarEvent]]:
+    """Expand VEVENTs (incl. RRULE) within [now, now + days) into local-time events.
+
+    Returns (calendar_name, events). The name comes from the feed's X-WR-CALNAME
+    ("" when absent). Event keys are feed-scoped (`feedId|uid|start`) so the same
+    event arriving via two subscriptions cannot collide.
+    """
     now = now or datetime.now()
     days = max(1, min(30, int(days)))
     window_end = now + timedelta(days=days)
 
     calendar = icalendar.Calendar.from_ical(ics_text)
+    name = str(calendar.get("X-WR-CALNAME") or "").strip()
     occurrences = recurring_ical_events.of(calendar).between(now, window_end)
 
     events: list[CalendarEvent] = []
@@ -69,11 +76,19 @@ def parse_events(ics_text: str, days: int, now: datetime | None = None) -> list[
         start_iso, all_day = _to_local(dtstart.dt)
         summary = str(component.get("SUMMARY") or "（无标题）").strip()
         uid = str(component.get("UID") or summary)
-        key = f"{uid}|{start_iso}"
+        key = f"{feed_id}|{uid}|{start_iso}" if feed_id else f"{uid}|{start_iso}"
         if key in seen:
             continue
         seen.add(key)
-        events.append(CalendarEvent(uid=uid, summary=summary, start=start_iso, allDay=all_day, key=key))
+        events.append(CalendarEvent(
+            uid=uid, summary=summary, start=start_iso, allDay=all_day, key=key, feedId=feed_id,
+        ))
 
     events.sort(key=lambda event: event.start)
-    return events
+    return name, events
+
+
+def parse_events(ics_text: str, days: int, now: datetime | None = None,
+                 feed_id: str = "") -> list[CalendarEvent]:
+    """Back-compat wrapper around parse_feed; returns just the events."""
+    return parse_feed(ics_text, days, now, feed_id)[1]
