@@ -152,6 +152,10 @@ class Settings:
     # Version of the app on its previous run; when it differs from the current
     # APP_VERSION the app shows the new version's changelog once after an update.
     lastRunVersion: str = ""
+    # Set to the target version just before an in-app update installs; cleared on the
+    # next launch. If the running version did not advance, the install failed and the
+    # app surfaces an "update failed" notice (see update_ui.UpdateManager.on_startup).
+    pendingUpdateVersion: str = ""
 
     def active_calendar_feeds(self) -> list[CalendarFeed]:
         """Feeds that are checked and have a URL — the only ones synced and displayed."""

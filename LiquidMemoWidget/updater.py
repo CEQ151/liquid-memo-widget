@@ -6,14 +6,17 @@ Pure network/process logic with no Qt dependency; the UI lives in app.py
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -23,6 +26,8 @@ from version import APP_VERSION, GITHUB_OWNER, GITHUB_REPO, GITHUB_URL
 API_BASE = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
 _TIMEOUT = 15
 CREATE_NO_WINDOW = 0x08000000
+DETACHED_PROCESS = 0x00000008
+UPDATE_HELPER_FLAG = "--apply-update"
 
 
 @dataclass
@@ -172,46 +177,91 @@ def download_installer(release: ReleaseInfo,
     return dest
 
 
+def _update_log_path() -> Path:
+    return Path(tempfile.gettempdir()) / "LiquidMemoWidget-update.log"
+
+
+def _installer_args(log_path: Path) -> list[str]:
+    """Inno Setup silent-install flags. /VERYSILENT hides the progress window;
+    /FORCECLOSEAPPLICATIONS + /SUPPRESSMSGBOXES keep it from erroring on held
+    files; /NORESTARTAPPLICATIONS stops Inno's restart manager from relaunching
+    the app (the helper owns the relaunch); /LOG leaves a postmortem trail."""
+    return [
+        "/VERYSILENT",
+        "/NORESTART",
+        "/SUPPRESSMSGBOXES",
+        "/FORCECLOSEAPPLICATIONS",
+        "/NORESTARTAPPLICATIONS",
+        f"/LOG={log_path}",
+    ]
+
+
+def _helper_command(installer: Path | str, parent_pid: int, target_exe: str) -> list[str]:
+    """Re-invoke this same (frozen) executable in update-helper mode."""
+    return [sys.executable, UPDATE_HELPER_FLAG, str(installer), str(parent_pid), str(target_exe)]
+
+
+def _wait_for_pid_exit(pid: int, timeout: float) -> None:
+    """Block until `pid` terminates (or timeout elapses). Pure ctypes so the
+    detached helper needs no third-party deps; a process we cannot open is
+    treated as already gone. HANDLE restype is set explicitly to avoid 64-bit
+    handle truncation."""
+    SYNCHRONIZE = 0x00100000
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    if not handle:
+        return
+    try:
+        kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def install_and_restart(installer: Path) -> None:
-    """Run the Inno installer silently after this process exits, then relaunch.
-
-    The helper PowerShell child survives our exit (Windows children are not
-    killed with the parent). Robustness against the previously shipped races:
-    - waits for this exact PID to terminate (no fixed sleep) so the installer
-      never starts while the app is still shutting down and holding file locks;
-    - /FORCECLOSEAPPLICATIONS + /SUPPRESSMSGBOXES stop Inno from popping error
-      dialogs if something still holds a file, /NORESTARTAPPLICATIONS stops the
-      restart manager from relaunching the app a second time (the helper owns
-      the relaunch);
-    - the relaunch lives in `finally`, so the app comes back even when the
-      install fails or the UAC prompt is declined;
-    - /LOG writes a diagnosis trail to %TEMP% for postmortems.
-
-    The caller must quit immediately after.
-    """
-    exe = sys.executable
-    quoted_installer = str(installer).replace("'", "''")
-    quoted_exe = exe.replace("'", "''")
-    log_path = Path(tempfile.gettempdir()) / "LiquidMemoWidget-update.log"
-    quoted_log = str(log_path).replace("'", "''")
-    script = (
-        f"Wait-Process -Id {os.getpid()} -Timeout 30 -ErrorAction SilentlyContinue; "
-        "Start-Sleep -Milliseconds 500; "
-        "try { "
-        f"Start-Process -FilePath '{quoted_installer}' -ArgumentList "
-        "'/SILENT','/NORESTART','/SUPPRESSMSGBOXES','/FORCECLOSEAPPLICATIONS',"
-        # Embedded quotes: PowerShell 5.1 joins ArgumentList without quoting, and
-        # Inno aborts when the /LOG file path (which breaks on a space) is invalid.
-        f"'/NORESTARTAPPLICATIONS','/LOG=\"{quoted_log}\"' -Wait "
-        "} catch {} finally { "
-        f"Start-Process -FilePath '{quoted_exe}' }}"
-    )
+    """Spawn the detached update helper (this exe in --apply-update mode) and
+    return. The helper survives our exit (a DETACHED_PROCESS child is not killed
+    with the parent); the caller MUST quit immediately after so the helper's
+    PID-wait can proceed and the installer never starts while we still hold file
+    locks."""
     subprocess.Popen(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-WindowStyle", "Hidden", "-Command", script],
-        creationflags=CREATE_NO_WINDOW,
+        _helper_command(installer, os.getpid(), sys.executable),
+        creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
         close_fds=True,
     )
+
+
+def apply_update(installer: str, parent_pid: int, target_exe: str) -> None:
+    """Update-helper entry, run in a separate detached process (no Qt): wait for
+    the app to exit, run the Inno installer silently, delete the temp installer,
+    then relaunch the app. Pure Python — no PowerShell — so it is testable and
+    free of shell-quoting hazards. The Inno loader self-elevates internally, so a
+    plain CreateProcess still triggers UAC, mirroring the old Start-Process path.
+    The relaunch lives in `finally` so the app comes back even if the install
+    fails or the UAC prompt is declined."""
+    installer_path = Path(installer)
+    _wait_for_pid_exit(parent_pid, 30)
+    time.sleep(0.5)  # let the OS release file locks the app held
+    try:
+        subprocess.run(
+            [str(installer_path), *_installer_args(_update_log_path())],
+            creationflags=CREATE_NO_WINDOW,
+            check=False,
+        )
+    except Exception:
+        pass
+    finally:
+        try:
+            installer_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            subprocess.Popen([target_exe], creationflags=DETACHED_PROCESS, close_fds=True)
+        except Exception:
+            pass
 
 
 def is_frozen() -> bool:

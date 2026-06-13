@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## What this is
 
@@ -26,38 +26,11 @@ pythonw .\RunLiquidMemoWidget.pyw
 .\Package.ps1 -Version 0.0.1 -SkipInstaller   # zip only
 ```
 
-**PyInstaller pitfall:** app sources under `LiquidMemoWidget/` ship via `--add-data` and are
-imported only at runtime, so PyInstaller never analyzes their imports. Any new stdlib or
-third-party module imported there must also be added to `Build.ps1` as `--hidden-import`
-(this shipped a launch crash once: `xml.etree` was missing). Smoke-test
-`dist\LiquidMemoWidget\LiquidMemoWidget.exe` after changing imports.
-
 There are **no automated tests and no linter configured**. `one_d3d_widget.py` has a manual
 `__main__` smoke-test entry that renders a standalone glass square. Releases are produced by
-`.github/workflows/release.yml`, triggered by pushing a `v*` tag. **Before tagging a release:**
-bump `APP_VERSION` in `LiquidMemoWidget/version.py` and add a `## vX.Y.Z` section to
-`CHANGELOG.md` documenting the changes — the workflow extracts that section as the GitHub
-Release body (and fails without it); the in-app update dialog and post-update changelog
-render the same text.
+`.github/workflows/release.yml`, triggered by pushing a `v*` tag.
 
 ## Architecture
-
-### Module layout
-The Qt app lives under `LiquidMemoWidget/` and uses **flat imports** (bare module names,
-resolved via a `sys.path` insert in the entry point), so modules reference each other
-directly (`from ui_common import ...`). `from __future__ import annotations` everywhere
-keeps type hints lazy, so windows/managers reference each other by duck-typed `self.app`
-without import cycles. Key files:
-- `ui_common.py` — shared leaf module: fonts/colors/helpers, the `SETTING_*` typography
-  constants, `enlarge_control_font`/`set_label_font`, `FluentSettingRow`, `InfoToolTipFilter`,
-  `FramelessDragMixin`, `tray_icon`. Imports no app/window/engine code.
-- `settings_ui.py` — `SettingsWindow`.  `update_ui.py` — update dialogs + `UpdateManager`.
-  `calendar_manager.py` — `CalendarManager` + sync tasks.
-- `app.py` — `MemoWindow` (the D3D surface), the memo content widgets/popups, `HistoryWindow`,
-  the skins, and `LiquidMemoApp` (lifecycle/orchestration); imports the four modules above.
-- `updater.py` — Qt-free update logic. New first-party modules ship via `--add-data` and are
-  imported at runtime, so splitting `app.py` further needs **no `Build.ps1` change** (only new
-  *third-party* imports need a `--hidden-import`).
 
 ### Two-layer rendering model
 `MemoWindow` (in `LiquidMemoWidget/app.py`) subclasses `OneGPUWidget` from the vendored
