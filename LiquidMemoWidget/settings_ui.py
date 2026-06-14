@@ -52,10 +52,7 @@ from ui_common import (
     SETTING_STATUS_FONT_PX,
     SETTING_TITLE_FONT_PX,
     add_soft_shadow,
-    css_rgba,
     enlarge_control_font,
-    mixed_font,
-    qcolor,
     set_label_font,
 )
 from startup import is_startup_enabled, set_startup

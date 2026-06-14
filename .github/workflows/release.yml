@@ -61,13 +61,13 @@ jobs:
           python -m pip install pyinstaller
 
       # Regression gate: import/construction smoke + updater unit tests must pass
-      # before we build and publish. Headless Qt via the offscreen platform.
+      # before we build and publish. tests/conftest.py forces Qt's offscreen
+      # platform, so no QT_QPA_PLATFORM env is needed here. pytest is pinned to a
+      # major version so a future release can't silently change gate semantics.
       - name: Run tests
         shell: pwsh
-        env:
-          QT_QPA_PLATFORM: offscreen
         run: |
-          python -m pip install pytest
+          python -m pip install "pytest>=8,<9"
           python -m pytest tests -q
 
       - name: Build portable app

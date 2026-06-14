@@ -201,22 +201,25 @@ def _helper_command(installer: Path | str, parent_pid: int, target_exe: str) -> 
     return [sys.executable, UPDATE_HELPER_FLAG, str(installer), str(parent_pid), str(target_exe)]
 
 
-def _wait_for_pid_exit(pid: int, timeout: float) -> None:
-    """Block until `pid` terminates (or timeout elapses). Pure ctypes so the
-    detached helper needs no third-party deps; a process we cannot open is
-    treated as already gone. HANDLE restype is set explicitly to avoid 64-bit
-    handle truncation."""
+def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
+    """Block until `pid` terminates (or timeout elapses). Returns True only when
+    the process is confirmed gone — it exited, or it could not be opened so it is
+    already gone — and False on timeout, so the caller can refuse to install over
+    a still-running app. Pure ctypes so the detached helper needs no third-party
+    deps. HANDLE restype is set explicitly to avoid 64-bit handle truncation."""
     SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0x00000000
     kernel32 = ctypes.windll.kernel32
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
     if not handle:
-        return
+        return True  # cannot open the process → treat it as already exited
     try:
-        kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+        return kernel32.WaitForSingleObject(handle, int(timeout * 1000)) == WAIT_OBJECT_0
     finally:
         kernel32.CloseHandle(handle)
 
@@ -237,13 +240,17 @@ def install_and_restart(installer: Path) -> None:
 def apply_update(installer: str, parent_pid: int, target_exe: str) -> None:
     """Update-helper entry, run in a separate detached process (no Qt): wait for
     the app to exit, run the Inno installer silently, delete the temp installer,
-    then relaunch the app. Pure Python — no PowerShell — so it is testable and
-    free of shell-quoting hazards. The Inno loader self-elevates internally, so a
-    plain CreateProcess still triggers UAC, mirroring the old Start-Process path.
-    The relaunch lives in `finally` so the app comes back even if the install
-    fails or the UAC prompt is declined."""
+    then relaunch the app. If the app does not exit within the timeout we abort
+    without installing or relaunching, so we never clobber a live, file-locked
+    process or spawn a duplicate instance (the persisted pendingUpdateVersion
+    surfaces the failed update on the next clean launch). Pure Python — no
+    PowerShell — so it is testable and free of shell-quoting hazards. The Inno
+    loader self-elevates internally, so a plain CreateProcess still triggers UAC,
+    mirroring the old Start-Process path. The relaunch lives in `finally` so the
+    app still comes back even if the install fails or the UAC prompt is declined."""
     installer_path = Path(installer)
-    _wait_for_pid_exit(parent_pid, 30)
+    if not _wait_for_pid_exit(parent_pid, 30):
+        return  # app never exited; do not install over a live process or double-launch
     time.sleep(0.5)  # let the OS release file locks the app held
     try:
         subprocess.run(

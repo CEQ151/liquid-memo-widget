@@ -106,7 +106,6 @@ from update_ui import UpdateManager
 from calendar_manager import CalendarManager
 
 
-
 MIN_WIDTH = 320
 MAX_WIDTH = 720
 MAX_WIDTH_RATIO = 0.52
@@ -174,8 +173,6 @@ def _dwm_flush() -> None:
         ctypes.windll.dwmapi.DwmFlush()
     except Exception:
         pass
-
-
 
 
 class RoundButton(QPushButton):
@@ -721,12 +718,6 @@ class EditDDLPopup(QDialog):
         self.hide()
 
 
-
-
-
-
-
-
 class HistoryWindow(QDialog):
     def __init__(self, app: "LiquidMemoApp") -> None:
         super().__init__(None, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -839,12 +830,6 @@ class HistoryWindow(QDialog):
         self.app.state.history.clear()
         self.app.save()
         self.refresh()
-
-
-
-
-
-
 
 
 # Fixed vertical chrome inside the window that is NOT glass padding: the top bar (drag handle +
@@ -2041,10 +2026,6 @@ class MemoWindow(OneGPUWidget):
         anim.setEasingCurve(QEasingCurve.InOutCubic)
         anim.finished.connect(lambda: self.app.archive_todo(todo_id))
         anim.start(QPropertyAnimation.DeleteWhenStopped)
-
-
-
-
 
 
 class LiquidMemoApp:

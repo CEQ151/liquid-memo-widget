@@ -50,7 +50,12 @@ def test_apply_update_waits_installs_cleans_and_relaunches(tmp_path, monkeypatch
     installer = tmp_path / "Setup.exe"
     installer.write_text("stub")
     calls = {}
-    monkeypatch.setattr(updater, "_wait_for_pid_exit", lambda pid, timeout: calls.__setitem__("wait", (pid, timeout)))
+
+    def fake_wait(pid, timeout):
+        calls["wait"] = (pid, timeout)
+        return True  # app exited cleanly
+
+    monkeypatch.setattr(updater, "_wait_for_pid_exit", fake_wait)
     monkeypatch.setattr(updater.time, "sleep", lambda _s: None)
 
     def fake_run(cmd, **kwargs):
@@ -73,7 +78,7 @@ def test_apply_update_relaunches_even_when_install_fails(tmp_path, monkeypatch):
     installer = tmp_path / "Setup.exe"
     installer.write_text("stub")
     calls = {}
-    monkeypatch.setattr(updater, "_wait_for_pid_exit", lambda pid, timeout: None)
+    monkeypatch.setattr(updater, "_wait_for_pid_exit", lambda pid, timeout: True)
     monkeypatch.setattr(updater.time, "sleep", lambda _s: None)
 
     def boom(cmd, **kwargs):
@@ -85,3 +90,22 @@ def test_apply_update_relaunches_even_when_install_fails(tmp_path, monkeypatch):
     updater.apply_update(str(installer), 1, "C:/App/App.exe")
 
     assert calls["popen"] == ["C:/App/App.exe"]  # finally-block relaunch still ran
+
+
+def test_apply_update_aborts_when_app_does_not_exit(tmp_path, monkeypatch):
+    # If the app never exits within the wait timeout, the helper must NOT install
+    # (it would clobber a live, file-locked process) nor relaunch (it would spawn
+    # a second instance). It leaves the installer in place and bails.
+    installer = tmp_path / "Setup.exe"
+    installer.write_text("stub")
+    calls = {}
+    monkeypatch.setattr(updater, "_wait_for_pid_exit", lambda pid, timeout: False)
+    monkeypatch.setattr(updater.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(updater.subprocess, "run", lambda cmd, **kwargs: calls.__setitem__("run", cmd))
+    monkeypatch.setattr(updater.subprocess, "Popen", lambda cmd, **kwargs: calls.__setitem__("popen", cmd))
+
+    updater.apply_update(str(installer), 4321, "C:/App/App.exe")
+
+    assert "run" not in calls    # never installed over the live app
+    assert "popen" not in calls  # never spawned a duplicate instance
+    assert installer.exists()    # installer left untouched
