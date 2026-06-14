@@ -53,6 +53,7 @@ from qfluentwidgets import (
     PushButton,
     SmoothScrollArea,
     TitleLabel,
+    ToolTipPosition,
     setTheme,
     Theme,
 )
@@ -87,6 +88,7 @@ from window_layer import (
 from qframelesswindow.windows.window_effect import WindowsWindowEffect
 from ui_common import (
     FONT_STACK_QSS,
+    InfoToolTipFilter,
     POPUP_INPUT_FONT_PX,
     SETTING_STATUS_FONT_PX,
     SETTING_TITLE_FONT_PX,
@@ -175,6 +177,15 @@ def _dwm_flush() -> None:
         pass
 
 
+def install_tooltip(widget: QWidget) -> None:
+    """Show the widget's tooltip as a readable qfluentwidgets bubble instead of a native
+    QToolTip. A native tooltip here inherits the owning row/button's text color (white on a
+    dark desktop) and an app-level `QToolTip` QSS rule cannot reliably override it, so the
+    bubble renders unreadable (black-on-black / white-on-white). The bubble sets its own
+    dark text + light background and reads the widget's existing setToolTip() text."""
+    widget.installEventFilter(InfoToolTipFilter(widget, showDelay=400, position=ToolTipPosition.TOP))
+
+
 class RoundButton(QPushButton):
     def __init__(self, text: str, size: int = 34, parent: QWidget | None = None, tone: str = "neutral") -> None:
         super().__init__(text, parent)
@@ -203,12 +214,14 @@ class RoundButton(QPushButton):
             QPushButton:pressed {{ background: {pressed}; }}
             """
         )
+        install_tooltip(self)
 
 
 class TodoTextLabel(QLabel):
     def __init__(self, text: str, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self.setToolTip(text)
+        install_tooltip(self)
         self.setTextFormat(Qt.PlainText)
         self.setWordWrap(True)
         self.setMinimumWidth(0)
@@ -342,6 +355,7 @@ class TodoRow(QFrame):
         self.urgent.setFixedSize(30, 30)
         self.urgent.setCursor(Qt.PointingHandCursor)
         self.urgent.setToolTip("加急并置顶")
+        install_tooltip(self.urgent)
         self.urgent.setStyleSheet(
             """
             QPushButton {
@@ -2035,6 +2049,9 @@ class LiquidMemoApp:
         setTheme(Theme.LIGHT)
         self.qt.setFont(mixed_font(10))
         self.qt.setWindowIcon(tray_icon())
+        # Tooltips are rendered as qfluentwidgets bubbles via install_tooltip(); a native
+        # QToolTip here inherits the owning widget's (white) text color and styling it through
+        # this app-level `*`/QToolTip rule is unreliable, so we don't try.
         self.qt.setStyleSheet(f"* {{ {FONT_STACK_QSS} }}")
         self.store = StateStore()
         self.state = self.store.load()
