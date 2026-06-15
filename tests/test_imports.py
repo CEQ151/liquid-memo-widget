@@ -17,6 +17,7 @@ def _stub_app():
 def test_split_ui_modules_build_without_engine(qapp):
     import ui_common  # noqa: F401
     import calendar_manager
+    import notify_manager
     import settings_ui
     import update_ui
     import updater
@@ -24,7 +25,7 @@ def test_split_ui_modules_build_without_engine(qapp):
     app = _stub_app()
 
     sw = settings_ui.SettingsWindow(app)
-    assert sw.nav.count() == 4  # 外观 / 行为 / 日历订阅 / 关于
+    assert sw.nav.count() == 5  # 外观 / 行为 / 提醒 / 日历订阅 / 关于
 
     release = updater.ReleaseInfo(
         tag="v9.9.9", version="9.9.9", notes="n", html_url="u",
@@ -33,6 +34,7 @@ def test_split_ui_modules_build_without_engine(qapp):
     update_ui.UpdateDialog(app, release)
     update_ui.ChangelogDialog("notes")
     calendar_manager.CalendarManager(app)
+    notify_manager.NotificationManager(app)
 
 
 def test_app_windows_build(qapp):
@@ -42,6 +44,5 @@ def test_app_windows_build(qapp):
         pytest.skip(f"app/engine not importable here: {exc}")
     app = _stub_app()
     app_mod.HistoryWindow(app)
-    add = app_mod.AddTodoPopup(None)
-    edit = app_mod.EditDDLPopup(None)
-    assert add.height() == 88 and edit.height() == 88
+    editor = app_mod.TodoEditorPopup(None)
+    assert editor.height() == 132

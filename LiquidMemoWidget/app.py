@@ -106,6 +106,7 @@ from ui_common import (
 from settings_ui import SettingsWindow
 from update_ui import UpdateManager
 from calendar_manager import CalendarManager
+from notify_manager import NotificationManager
 
 
 MIN_WIDTH = 320
@@ -138,6 +139,10 @@ DDL_EMPTY_HINT = "＋"
 # Calendar subscription ("日程" group).
 CALENDAR_HEADER_HEIGHT = 30
 _WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
+# Top/bottom breathing room inside the scrollable list, so the first and last rows are never
+# flush against the scroll viewport edge (which sits near the glass's rounded top/bottom on the
+# glass skin) and get visually clipped. Counted in the window-height budget so it never squeezes.
+LIST_EDGE_PAD = 7
 
 
 def format_event_time(event: "CalendarEvent") -> str:
@@ -184,6 +189,39 @@ def install_tooltip(widget: QWidget) -> None:
     bubble renders unreadable (black-on-black / white-on-white). The bubble sets its own
     dark text + light background and reads the widget's existing setToolTip() text."""
     widget.installEventFilter(InfoToolTipFilter(widget, showDelay=400, position=ToolTipPosition.TOP))
+
+
+def location_line_height() -> int:
+    """Extra height a row gains from its dim second '📍 location' line (the 10pt label plus the
+    2px text-column spacing). Shared by row layout and the window height pre-calc so they agree."""
+    return QFontMetrics(mixed_font(10)).height() + 2
+
+
+_text_measure_label: QLabel | None = None
+
+
+def wrapped_text_height(text: str, width: int) -> int:
+    """Height a 12pt word-wrapped title label needs to show `text` in full at `width`.
+
+    Measured through an off-screen QLabel configured exactly like the real title labels
+    (TodoTextLabel: PlainText, wordWrap), so the value matches what the label actually
+    renders. QFontMetrics.boundingRect with TextWrapAnywhere disagreed with QLabel's
+    word-boundary wrapping and underestimated tall rows, clipping the first/last line."""
+    global _text_measure_label
+    label = _text_measure_label
+    if label is None:
+        label = QLabel()
+        label.setTextFormat(Qt.PlainText)
+        label.setWordWrap(True)
+        label.setFont(mixed_font(12))
+        _text_measure_label = label
+    label.setText(text)
+    height = label.heightForWidth(max(90, width))
+    if height <= 0:  # QLabel returns -1 if it somehow has no height-for-width
+        height = QFontMetrics(mixed_font(12)).boundingRect(
+            QRect(0, 0, max(90, width), 2000), Qt.TextWordWrap, text
+        ).height()
+    return height
 
 
 class RoundButton(QPushButton):
@@ -328,7 +366,18 @@ class TodoRow(QFrame):
         self.text = TodoTextLabel(todo.text)
         self.text.setFont(mixed_font(12))
         self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        layout.addWidget(self.text, 1)
+        # Location shows on a dim second line under the title, only when set (📍 …); the column
+        # stays single-line otherwise so rows without a location are not taller.
+        self.location_label = TodoTextLabel("")
+        self.location_label.setFont(mixed_font(10))
+        self.location_label.setWordWrap(False)
+        self.location_label.setVisible(False)
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+        text_col.addWidget(self.text)
+        text_col.addWidget(self.location_label)
+        layout.addLayout(text_col, 1)
 
         # DDL column: solid vertical separator + deadline label. Both stay hidden until the
         # layout pass (apply_text_width) decides the column should be shown for this view.
@@ -343,13 +392,33 @@ class TodoRow(QFrame):
         self.ddl_label.setFont(mixed_font(11))
         self.ddl_label.setFixedWidth(DDL_COL_MIN)  # adaptive width set in apply_text_width
         self.ddl_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.ddl_label.setToolTip(todo.ddl or "点击设置截止时间")
+        self.ddl_label.setToolTip(todo.ddl or "点击编辑事项")
         self.ddl_label.setVisible(False)
-        self.ddl_label.clicked.connect(lambda: parent_window.edit_ddl(todo.id))
+        self.ddl_label.clicked.connect(lambda: parent_window.edit_todo(todo.id))
         layout.addWidget(self.ddl_label)
 
         # Style text + ddl together, now that both labels exist.
         self.apply_text_style(parent_window.text_color_for(todo), parent_window.text_needs_halo())
+
+        self.edit_btn = QPushButton("✎")
+        self.edit_btn.setFixedSize(30, 30)
+        self.edit_btn.setCursor(Qt.PointingHandCursor)
+        self.edit_btn.setToolTip("编辑事项（内容 / 地点 / DDL）")
+        install_tooltip(self.edit_btn)
+        self.edit_btn.setStyleSheet(
+            """
+            QPushButton {
+                border: none;
+                border-radius: 15px;
+                background: rgba(255,255,255,45);
+                font-size: 14px;
+            }
+            QPushButton:hover { background: rgba(255,255,255,115); }
+            QPushButton:pressed { background: rgba(255,255,255,160); }
+            """
+        )
+        self.edit_btn.clicked.connect(lambda: parent_window.edit_todo(todo.id))
+        layout.addWidget(self.edit_btn)
 
         self.urgent = QPushButton("❗")
         self.urgent.setFixedSize(30, 30)
@@ -399,6 +468,7 @@ class TodoRow(QFrame):
         alpha = 0.45 if self.todo.done else 1.0
         decoration = "text-decoration: line-through;" if self.todo.done else ""
         self.text.setStyleSheet(f"{FONT_STACK_QSS} font-size: 12pt; color: {css_rgba(color, alpha)}; {decoration}")
+        self.location_label.setStyleSheet(f"{FONT_STACK_QSS} font-size: 10pt; color: {css_rgba(color, alpha * 0.6)}; {decoration}")
         if ddl_status == "overdue":
             ddl_css = f"color: {DDL_OVERDUE_COLOR}; font-weight: 600;"
         elif ddl_status == "near":
@@ -437,10 +507,15 @@ class TodoRow(QFrame):
                 self.ddl_label.setText(ddl_metrics.elidedText(raw, Qt.ElideRight, ddl_width))
             else:
                 self.ddl_label.setText(DDL_EMPTY_HINT)
-        metrics = QFontMetrics(self.text.font())
-        flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
-        rect = metrics.boundingRect(QRect(0, 0, text_width, 2000), flags, self.todo.text)
-        height = max(ROW_HEIGHT, rect.height() + 18)
+        loc = self.todo.location.strip()
+        if loc:
+            self.location_label.setFixedWidth(text_width)
+            loc_metrics = QFontMetrics(self.location_label.font())
+            self.location_label.set_full_text(f"📍 {loc}")
+            self.location_label.setText(loc_metrics.elidedText(f"📍 {loc}", Qt.ElideRight, text_width))
+        self.location_label.setVisible(bool(loc))
+        height = wrapped_text_height(self.text.text(), text_width) + (location_line_height() if loc else 0)
+        height = max(ROW_HEIGHT, height + 18)
         self.setFixedHeight(height)
         return height
 
@@ -497,7 +572,17 @@ class CalendarRow(QFrame):
         self.text = TodoTextLabel(f"📅 {event.summary}")
         self.text.setFont(mixed_font(12))
         self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        layout.addWidget(self.text, 1)
+        # Location (from the ICS LOCATION field) on a dim second line, only when present.
+        self.location_label = TodoTextLabel("")
+        self.location_label.setFont(mixed_font(10))
+        self.location_label.setWordWrap(False)
+        self.location_label.setVisible(False)
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+        text_col.addWidget(self.text)
+        text_col.addWidget(self.location_label)
+        layout.addLayout(text_col, 1)
 
         self.ddl_sep = QFrame()
         self.ddl_sep.setObjectName("ddlSeparator")
@@ -536,6 +621,7 @@ class CalendarRow(QFrame):
         alpha = 0.4 if self.done else 1.0
         decoration = "text-decoration: line-through;" if self.done else ""
         self.text.setStyleSheet(f"{FONT_STACK_QSS} font-size: 12pt; color: {css_rgba(color, alpha)}; {decoration}")
+        self.location_label.setStyleSheet(f"{FONT_STACK_QSS} font-size: 10pt; color: {css_rgba(color, alpha * 0.6)}; {decoration}")
         if status == "overdue":
             time_css = f"color: {DDL_OVERDUE_COLOR}; font-weight: 600;"
         elif status == "near":
@@ -562,10 +648,15 @@ class CalendarRow(QFrame):
         self.ddl_label.setFixedWidth(ddl_width)
         metrics = QFontMetrics(self.ddl_label.font())
         self.ddl_label.setText(metrics.elidedText(format_event_time(self.cal_event), Qt.ElideRight, ddl_width))
-        text_metrics = QFontMetrics(self.text.font())
-        flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
-        rect = text_metrics.boundingRect(QRect(0, 0, text_width, 2000), flags, self.text.text())
-        height = max(ROW_HEIGHT, rect.height() + 18)
+        loc = self.cal_event.location.strip()
+        if loc:
+            self.location_label.setFixedWidth(text_width)
+            loc_metrics = QFontMetrics(self.location_label.font())
+            self.location_label.set_full_text(f"📍 {loc}")
+            self.location_label.setText(loc_metrics.elidedText(f"📍 {loc}", Qt.ElideRight, text_width))
+        self.location_label.setVisible(bool(loc))
+        height = wrapped_text_height(self.text.text(), text_width) + (location_line_height() if loc else 0)
+        height = max(ROW_HEIGHT, height + 18)
         self.setFixedHeight(height)
         return height
 
@@ -573,17 +664,19 @@ class CalendarRow(QFrame):
         self.parent_window.toggle_calendar_event(self.cal_event.key, self.checkbox.isChecked())
 
 
-class AddTodoPopup(QDialog):
+class TodoEditorPopup(QDialog):
+    """Add or edit a todo: 内容 / 地点(可选) / DDL(可选). Shared by the "+" add flow and the
+    per-row pencil edit. Qt.Tool (not Qt.Popup) so the QLineEdits reliably get keyboard focus
+    on Windows; the WindowDeactivate handler gives click-outside-to-dismiss."""
+
     def __init__(self, parent_window: "MemoWindow") -> None:
-        # Qt.Tool (not Qt.Popup): a Popup window grabs input and does not reliably hand
-        # keyboard focus to the QLineEdit on Windows, so the user could not type. The
-        # WindowDeactivate handler below gives the same click-outside-to-dismiss behavior.
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.parent_window = parent_window
+        self._edit_id: str | None = None  # None = add mode, else the todo being edited
         self.setWindowTitle("添加事项")
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setFixedSize(460, 88)
+        self.setFixedSize(460, 132)
 
         self.panel = QFrame(self)
         self.panel.setObjectName("addPanel")
@@ -610,33 +703,60 @@ class AddTodoPopup(QDialog):
         )
         add_soft_shadow(self.panel, blur=22, y=8, alpha=60)
 
-        layout = QHBoxLayout(self.panel)
-        layout.setContentsMargins(18, 12, 12, 12)
-        layout.setSpacing(10)
+        outer = QVBoxLayout(self.panel)
+        outer.setContentsMargins(18, 14, 14, 14)
+        outer.setSpacing(10)
         self.input = QLineEdit()
         self.input.setPlaceholderText("输入事项")
         self.input.returnPressed.connect(self.accept)
-        layout.addWidget(self.input, 1)
+        outer.addWidget(self.input)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        self.location_input = QLineEdit()
+        self.location_input.setPlaceholderText("地点（可选）")
+        self.location_input.returnPressed.connect(self.accept)
+        row.addWidget(self.location_input, 1)
         self.ddl_input = QLineEdit()
         self.ddl_input.setPlaceholderText("DDL（可选）")
-        self.ddl_input.setFixedWidth(140)
+        self.ddl_input.setFixedWidth(150)
         self.ddl_input.returnPressed.connect(self.accept)
-        layout.addWidget(self.ddl_input)
+        row.addWidget(self.ddl_input)
         self.ok = RoundButton("✓", 46, tone="confirm")
         self.ok.clicked.connect(self.accept)
-        layout.addWidget(self.ok)
+        row.addWidget(self.ok)
+        outer.addLayout(row)
 
-    def open_near(self, point: QPoint, width: int) -> None:
+    def _position(self, point: QPoint, width: int) -> None:
         width = max(420, min(600, width))
-        self.setFixedSize(width, 88)
+        self.setFixedSize(width, 132)
         self.panel.setGeometry(0, 0, self.width(), self.height())
         self.move(point)
-        self.input.clear()
-        self.ddl_input.clear()
+
+    def _show_focused(self) -> None:
         self.show()
         self.raise_()
         self.activateWindow()
-        QTimer.singleShot(0, lambda: self.input.setFocus(Qt.PopupFocusReason))
+        QTimer.singleShot(0, lambda: (self.input.setFocus(Qt.PopupFocusReason), self.input.selectAll()))
+
+    def open_add(self, point: QPoint, width: int) -> None:
+        self._edit_id = None
+        self.setWindowTitle("添加事项")
+        self.input.clear()
+        self.location_input.clear()
+        self.ddl_input.clear()
+        self._position(point, width)
+        self._show_focused()
+
+    def open_edit(self, todo_id: str, text: str, location: str, ddl: str, point: QPoint, width: int) -> None:
+        self._edit_id = todo_id
+        self.setWindowTitle("编辑事项")
+        self.input.setText(text)
+        self.location_input.setText(location)
+        self.ddl_input.setText(ddl)
+        self._position(point, width)
+        self._show_focused()
 
     def event(self, event) -> bool:
         if event.type() == QEvent.WindowDeactivate:
@@ -651,84 +771,14 @@ class AddTodoPopup(QDialog):
 
     def accept(self) -> None:
         text = self.input.text().strip()
+        location = self.location_input.text().strip()
+        ddl = self.ddl_input.text().strip()
         if text:
-            self.parent_window.add_todo(text, self.ddl_input.text().strip())
-        self.hide()
-
-
-class EditDDLPopup(QDialog):
-    """Single-field popup to set/clear the deadline of an existing todo. Mirrors AddTodoPopup's
-    Qt.Tool + click-outside-to-dismiss behavior; the editing target is remembered per open."""
-
-    def __init__(self, parent_window: "MemoWindow") -> None:
-        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.parent_window = parent_window
-        self._todo_id: str | None = None
-        self.setWindowTitle("设置截止时间")
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setFixedSize(380, 88)
-
-        self.panel = QFrame(self)
-        self.panel.setObjectName("addPanel")
-        self.panel.setGeometry(0, 0, self.width(), self.height())
-        self.panel.setStyleSheet(
-            f"""
-            QFrame#addPanel {{
-                {FONT_STACK_QSS}
-                border-radius: 22px;
-                border: 1px solid rgba(255,255,255,170);
-                background: rgba(248,252,255,238);
-            }}
-            QLineEdit {{
-                {FONT_STACK_QSS}
-                border: 1px solid rgba(255,255,255,145);
-                border-radius: 17px;
-                background: rgba(255,255,255,150);
-                color: #111820;
-                font-size: {POPUP_INPUT_FONT_PX}px;
-                padding: 9px 14px;
-                selection-background-color: rgba(33,150,243,120);
-            }}
-            """
-        )
-        add_soft_shadow(self.panel, blur=22, y=8, alpha=60)
-
-        layout = QHBoxLayout(self.panel)
-        layout.setContentsMargins(18, 12, 12, 12)
-        layout.setSpacing(10)
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("DDL（留空清除）")
-        self.input.returnPressed.connect(self.accept)
-        layout.addWidget(self.input, 1)
-        self.ok = RoundButton("✓", 46, tone="confirm")
-        self.ok.clicked.connect(self.accept)
-        layout.addWidget(self.ok)
-
-    def open_for(self, todo_id: str, current: str, point: QPoint) -> None:
-        self._todo_id = todo_id
-        self.move(point)
-        self.input.setText(current)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        QTimer.singleShot(0, lambda: (self.input.setFocus(Qt.PopupFocusReason), self.input.selectAll()))
-
-    def event(self, event) -> bool:
-        if event.type() == QEvent.WindowDeactivate:
-            self.hide()
-        return super().event(event)
-
-    def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key_Escape:
-            self.hide()
-            return
-        super().keyPressEvent(event)
-
-    def accept(self) -> None:
-        if self._todo_id is not None:
-            self.parent_window.set_ddl(self._todo_id, self.input.text().strip())
-        self._todo_id = None
+            if self._edit_id is not None:
+                self.parent_window.update_todo(self._edit_id, text, location, ddl)
+            else:
+                self.parent_window.add_todo(text, location, ddl)
+        self._edit_id = None
         self.hide()
 
 
@@ -1021,7 +1071,7 @@ class MemoWindow(OneGPUWidget):
         self.list_widget = QWidget()
         self.list_widget.setStyleSheet("background: transparent;")
         self.list_layout = QVBoxLayout(self.list_widget)
-        self.list_layout.setContentsMargins(0, 2, 0, 2)
+        self.list_layout.setContentsMargins(0, LIST_EDGE_PAD, 0, LIST_EDGE_PAD)
         self.list_layout.setSpacing(0)
         self.scroll.setWidget(self.list_widget)
         self.layout.addWidget(self.scroll, 1)
@@ -1031,8 +1081,7 @@ class MemoWindow(OneGPUWidget):
         self.empty.setStyleSheet("color: rgba(17,24,32,120); font-size: 15px;")
         self.layout.addWidget(self.empty, 1)
 
-        self.add_popup = AddTodoPopup(self)
-        self.edit_ddl_popup = EditDDLPopup(self)
+        self.add_popup = TodoEditorPopup(self)
 
     def protect_content_layer(self) -> None:
         if self.container:
@@ -1247,9 +1296,9 @@ class MemoWindow(OneGPUWidget):
     def _is_interactive_point(self, point: QPoint) -> bool:
         widgets: list[QWidget] = [self.add_button, self.hide_button, self.expand_button]
         for row in self._rows.values():
-            # ddl_label is the editable DDLCell (click-to-edit); the time cell on calendar rows
-            # is display-only, so only their checkbox is interactive.
-            widgets.extend([row.checkbox, row.urgent, row.ddl_label])
+            # edit_btn (✎) opens the editor and ddl_label (the DDLCell) also opens it on click;
+            # the time cell on calendar rows is display-only, so only their checkbox is interactive.
+            widgets.extend([row.checkbox, row.urgent, row.ddl_label, row.edit_btn])
         for row in self._event_rows.values():
             widgets.append(row.checkbox)
         # Wheel scrolling over the list is handled by the global wheel hook (see
@@ -1487,7 +1536,6 @@ class MemoWindow(OneGPUWidget):
         return (
             self._is_window_moving
             or self.add_popup.isVisible()
-            or self.edit_ddl_popup.isVisible()
             or self.app.settings_window.isVisible()
             or self.app.history_window.isVisible()
         )
@@ -1873,14 +1921,17 @@ class MemoWindow(OneGPUWidget):
         ddl_reserve = (ddl_width + DDL_SEP_WIDTH + DDL_COL_GAPS) if column_active else 0
         width = self._adaptive_width(active, events, screen, ddl_reserve)
         text_width = self._text_width_for_window(width, ddl_reserve)
-        content_height = sum(self._measure_row_height(todo.text, text_width) for todo in active)
+        content_height = sum(self._measure_row_height(todo.text, text_width, todo.location) for todo in active)
         if events:
             # Calendar rows render "📅 {summary}", which wraps (and grows taller than ROW_HEIGHT)
             # for long titles — measure them like todos so the window height isn't underestimated
             # (which previously left expanded mode hiding the scrollbar yet still clipping rows).
             content_height += CALENDAR_HEADER_HEIGHT
-            content_height += sum(self._measure_row_height(f"📅 {event.summary}", text_width) for event in events)
+            content_height += sum(self._measure_row_height(f"📅 {event.summary}", text_width, event.location) for event in events)
         content_height = max(content_height, ROW_HEIGHT)
+        # The scrollable list adds top/bottom breathing room around the rows; budget it here so
+        # the window grows to keep the first/last rows fully visible instead of squeezing them.
+        content_height += 2 * LIST_EDGE_PAD
         # Solve the window height so that, after the glass's proportional vertical padding, the
         # top block + rows + corner margin still fit inside the glass: H*scale = needed.
         scale = self.skin.geometry_scale
@@ -1930,12 +1981,15 @@ class MemoWindow(OneGPUWidget):
         text_widths = [metrics.horizontalAdvance(todo.text) for todo in active]
         text_widths += [metrics.horizontalAdvance(f"📅 {event.summary}") for event in events]
         longest = max(text_widths) if text_widths else 0
-        chrome = OUTER_X * 2 + 12 + 18 + 30 + 28 + 24 + ddl_reserve
+        chrome = OUTER_X * 2 + 12 + 18 + 30 + 28 + 24 + 40 + ddl_reserve  # +40: 编辑✎按钮 + 间距
         max_width = min(MAX_WIDTH, int(screen.width() * MAX_WIDTH_RATIO), screen.width() - 64)
         return max(MIN_WIDTH, min(max_width, longest + chrome))
 
     def _text_width_for_window(self, width: int, ddl_reserve: int = 0) -> int:
-        return max(90, width - (OUTER_X * 2 + 12 + 18 + 30 + 28 + 12) - ddl_reserve)
+        # Must mirror _adaptive_width's chrome (incl. the +40 编辑✎按钮 reserve); otherwise the
+        # title label is pinned wider than the row can hold and pushes the trailing ❗ button off
+        # the right edge, where it clips out of view.
+        return max(90, width - (OUTER_X * 2 + 12 + 18 + 30 + 28 + 12 + 40) - ddl_reserve)
 
     def _time_column_width(self, active: list[TodoItem], events: list[CalendarEvent], expanded: bool = False) -> int:
         # Width that fits the widest deadline/event-time text in this view (so they show in
@@ -1948,11 +2002,11 @@ class MemoWindow(OneGPUWidget):
         cap = DDL_COL_EXPANDED_MAX if expanded else DDL_COL_MAX
         return max(DDL_COL_MIN, min(cap, longest + DDL_COL_PAD))
 
-    def _measure_row_height(self, text: str, text_width: int) -> int:
-        metrics = QFontMetrics(mixed_font(12))
-        flags = Qt.TextWordWrap | Qt.TextWrapAnywhere
-        rect = metrics.boundingRect(QRect(0, 0, max(90, text_width), 2000), flags, text)
-        return max(ROW_HEIGHT, rect.height() + 18)
+    def _measure_row_height(self, text: str, text_width: int, location: str = "") -> int:
+        # Mirror TodoRow/CalendarRow.apply_text_width so the window height pre-calc matches the
+        # rows' actual heights (incl. the optional 📍 location second line).
+        height = wrapped_text_height(text, text_width) + (location_line_height() if location.strip() else 0)
+        return max(ROW_HEIGHT, height + 18)
 
     def _keep_inside_screen(self, screen: QRect) -> None:
         if not self.isVisible():
@@ -1965,43 +2019,51 @@ class MemoWindow(OneGPUWidget):
         if x != self.x() or y != self.y():
             self.move(x, y)
 
-    def show_add_popup(self) -> None:
+    def _popup_position(self, popup_width: int, anchor: QPoint, popup_height: int = 132) -> QPoint:
         screen = QApplication.primaryScreen().availableGeometry()
-        popup_width = max(400, min(560, self.width() + 56))
-        popup_height = 74
-        x = self.x() + (self.width() - popup_width) // 2
-        y = self.y() + self.height() + 10
+        x = min(max(anchor.x(), screen.left() + 12), screen.right() - popup_width - 12)
+        y = anchor.y()
         if y + popup_height > screen.bottom() - 12:
-            y = self.y() - popup_height - 10
-        x = min(max(x, screen.left() + 12), screen.right() - popup_width - 12)
+            y = anchor.y() - popup_height - 12
         y = min(max(y, screen.top() + 12), screen.bottom() - popup_height - 12)
-        self.add_popup.open_near(QPoint(x, y), popup_width)
+        return QPoint(x, y)
 
-    def add_todo(self, text: str, ddl: str = "") -> None:
+    def show_add_popup(self) -> None:
+        popup_width = max(420, min(600, self.width() + 56))
+        anchor = QPoint(self.x() + (self.width() - popup_width) // 2, self.y() + self.height() + 10)
+        self.add_popup.open_add(self._popup_position(popup_width, anchor), popup_width)
+
+    def add_todo(self, text: str, location: str = "", ddl: str = "") -> None:
         next_order = max([todo.order for todo in self.app.state.todos] + [0]) + 1
-        self.app.state.todos.append(TodoItem(id=str(uuid4()), text=text, ddl=ddl, order=next_order))
+        self.app.state.todos.append(
+            TodoItem(id=str(uuid4()), text=text, ddl=ddl, location=location, order=next_order)
+        )
         self.app.save()
         self.refresh()
 
-    def edit_ddl(self, todo_id: str) -> None:
+    def edit_todo(self, todo_id: str) -> None:
         todo = next((item for item in self.app.state.todos if item.id == todo_id), None)
         if todo is None:
             return
+        popup_width = max(420, min(600, self.width() + 56))
         row = self._rows.get(todo_id)
-        screen = QApplication.primaryScreen().availableGeometry()
-        popup = self.edit_ddl_popup
         if row is not None:
-            anchor = row.ddl_label.mapToGlobal(QPoint(0, row.ddl_label.height() + 6))
+            anchor = row.edit_btn.mapToGlobal(QPoint(0, row.edit_btn.height() + 6))
         else:
             anchor = QPoint(self.x(), self.y() + self.height() + 10)
-        x = min(max(anchor.x(), screen.left() + 12), screen.right() - popup.width() - 12)
-        y = min(max(anchor.y(), screen.top() + 12), screen.bottom() - popup.height() - 12)
-        popup.open_for(todo_id, todo.ddl, QPoint(x, y))
+        self.add_popup.open_edit(
+            todo_id, todo.text, todo.location, todo.ddl,
+            self._popup_position(popup_width, anchor), popup_width,
+        )
 
-    def set_ddl(self, todo_id: str, ddl: str) -> None:
+    def update_todo(self, todo_id: str, text: str, location: str, ddl: str) -> None:
         todo = next((item for item in self.app.state.todos if item.id == todo_id), None)
-        if todo is None or todo.ddl == ddl:
+        if todo is None:
             return
+        if (todo.text, todo.location, todo.ddl) == (text, location, ddl):
+            return
+        todo.text = text
+        todo.location = location
         todo.ddl = ddl
         self.app.save()
         self.refresh()
@@ -2062,6 +2124,7 @@ class LiquidMemoApp:
         self.settings_window = SettingsWindow(self)
         self.history_window = HistoryWindow(self)
         self.calendar = CalendarManager(self)
+        self.notifier = NotificationManager(self)
         self.updater = UpdateManager(self)
         self.tray_menu: QMenu | None = None
         self.tray = QSystemTrayIcon(tray_icon())
@@ -2076,6 +2139,8 @@ class LiquidMemoApp:
         self.window.show()
         # Kick off the first calendar sync once the event loop is about to run.
         QTimer.singleShot(0, self.calendar.start)
+        # Start the reminder scan after the window/state have settled.
+        QTimer.singleShot(2000, self.notifier.start)
         # Changelog-after-update + delayed silent update check, after the UI settles.
         QTimer.singleShot(1500, self.updater.on_startup)
         return self.qt.exec()

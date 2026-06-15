@@ -199,6 +199,18 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         )
         self.edge_autohide.checkedChanged.connect(lambda _checked: self._apply())
 
+        self._section("提醒")
+        self.notify_enabled = self._switch_row(
+            "启用系统提醒", "日程或待办临近截止时，在屏幕右下角弹出 Windows 系统通知。",
+            self.app.state.settings.notificationsEnabled,
+        )
+        self.notify_enabled.checkedChanged.connect(lambda _checked: self._apply())
+        self.notify_minutes = self._spinbox_row(
+            "提前提醒（分钟）", "在开始/截止时间前这么多分钟提醒；全天日程固定当天上午 9 点提醒。",
+            self.app.state.settings.notifyMinutesBefore, 1, 1440,
+        )
+        self.notify_minutes.valueChanged.connect(lambda _value: self._apply())
+
         self._section("日历订阅")
         self.calendar_enabled = self._switch_row(
             "启用日历订阅", "开启后自动同步勾选的日历订阅中近 N 天的日程。", self.app.state.settings.calendarEnabled
@@ -590,6 +602,8 @@ class SettingsWindow(FramelessDragMixin, QDialog):
             self.position.blockSignals(True),
             self.startup.blockSignals(True),
             self.edge_autohide.blockSignals(True),
+            self.notify_enabled.blockSignals(True),
+            self.notify_minutes.blockSignals(True),
             self.calendar_enabled.blockSignals(True),
             self.calendar_days.blockSignals(True),
         ]
@@ -607,13 +621,15 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         self._last_startup_checked = is_startup_enabled()
         self.startup.setChecked(self._last_startup_checked)
         self.edge_autohide.setChecked(settings.edgeAutoHide)
+        self.notify_enabled.setChecked(settings.notificationsEnabled)
+        self.notify_minutes.setValue(settings.notifyMinutesBefore)
         self.calendar_enabled.setChecked(settings.calendarEnabled)
         self.calendar_days.setValue(settings.calendarSyncDays)
         self.refresh_feed_list()
         self.refresh_calendar_status()
         for widget, blocked in zip(
             [self.skin, self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup,
-             self.edge_autohide, self.calendar_enabled, self.calendar_days],
+             self.edge_autohide, self.notify_enabled, self.notify_minutes, self.calendar_enabled, self.calendar_days],
             blockers,
         ):
             widget.blockSignals(blocked)
@@ -660,6 +676,8 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         settings.completeBehavior = str(self.complete.currentData())
         settings.layerMode = "alwaysVisibleClickThrough"
         settings.edgeAutoHide = self.edge_autohide.isChecked()
+        settings.notificationsEnabled = self.notify_enabled.isChecked()
+        settings.notifyMinutesBefore = int(self.notify_minutes.value())
         self.app.state.window.startPosition = str(self.position.currentData())
         if self.app.state.window.startPosition == "current":
             self.app.state.window.x = self.app.window.x()
@@ -684,3 +702,6 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         self.app.window.apply_settings()
         if calendar_changed:
             self.app.calendar.on_settings_changed()
+        # Re-scan so toggling on / lowering the lead time reminds immediately; no-ops when
+        # disabled, and the per-key dedup keeps it from re-toasting on every settings edit.
+        self.app.notifier.check_now()

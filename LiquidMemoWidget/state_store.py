@@ -74,6 +74,7 @@ class TodoItem:
     id: str = field(default_factory=lambda: str(uuid4()))
     text: str = ""
     ddl: str = ""
+    location: str = ""
     urgent: bool = False
     done: bool = False
     createdAt: str = field(default_factory=utc_now)
@@ -86,6 +87,7 @@ class TodoItem:
             id=str(data.get("id") or uuid4()),
             text=str(data.get("text") or ""),
             ddl=str(data.get("ddl") or ""),
+            location=str(data.get("location") or ""),
             urgent=bool(data.get("urgent", False)),
             done=bool(data.get("done", False)),
             createdAt=str(data.get("createdAt") or utc_now()),
@@ -149,6 +151,11 @@ class Settings:
     calendarFeeds: list[CalendarFeed] = field(default_factory=list)
     calendarFeedArchive: list[CalendarFeed] = field(default_factory=list)
     calendarSyncDays: int = 7
+    # System reminders: when enabled, a background scan pops a native Windows toast
+    # (tray balloon) `notifyMinutesBefore` minutes before a calendar event or a todo's
+    # deadline. All-day events instead remind once on the day (see notify_manager).
+    notificationsEnabled: bool = False
+    notifyMinutesBefore: int = 15
     # Version of the app on its previous run; when it differs from the current
     # APP_VERSION the app shows the new version's changelog once after an update.
     lastRunVersion: str = ""
@@ -167,6 +174,7 @@ class CalendarEvent:
     uid: str = ""
     summary: str = ""
     start: str = ""  # ISO local datetime (or date for all-day)
+    location: str = ""  # from the ICS LOCATION field; "" when absent
     allDay: bool = False
     # Stable identity for one occurrence (a recurring series yields one key per instance), used
     # to remember which events the user checked off across re-syncs. Feed-scoped, so the same
@@ -182,6 +190,7 @@ class CalendarEvent:
             uid=uid,
             summary=str(data.get("summary") or ""),
             start=start,
+            location=str(data.get("location") or ""),
             allDay=bool(data.get("allDay", False)),
             key=str(data.get("key") or f"{uid}|{start}"),
             feedId=str(data.get("feedId") or ""),
@@ -200,6 +209,9 @@ class AppState:
     calendarDoneKeys: list[str] = field(default_factory=list)
     calendarLastSync: str | None = None
     calendarLastError: str | None = None
+    # Keys (calendar event / todo) the reminder scan has already toasted, so a fired
+    # reminder is not repeated on the next scan or after a relaunch.
+    notifiedKeys: list[str] = field(default_factory=list)
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "AppState":
@@ -213,6 +225,8 @@ class AppState:
         if settings.skin not in ("acrylic", "glass"):
             settings.skin = "acrylic"
         settings.calendarSyncDays = max(1, min(30, int(settings.calendarSyncDays or 7)))
+        settings.notificationsEnabled = bool(settings.notificationsEnabled)
+        settings.notifyMinutesBefore = max(1, min(1440, int(settings.notifyMinutesBefore or 15)))
         # The generic loop above leaves dataclass lists as raw dicts; rebuild them typed.
         settings.calendarFeeds = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeeds") or []]
         settings.calendarFeedArchive = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeedArchive") or []]
@@ -221,6 +235,7 @@ class AppState:
         history = [TodoItem.from_dict(item) for item in data.get("history") or []]
         events = [CalendarEvent.from_dict(item) for item in data.get("calendarEvents") or []]
         done_keys = [str(key) for key in data.get("calendarDoneKeys") or []]
+        notified_keys = [str(key) for key in data.get("notifiedKeys") or []]
         # v3 -> v4 migration: the single `calendarUrl` string becomes the first feed; cached
         # events and done-keys are retagged to the new feed-scoped identity so nothing is lost.
         legacy_url = str(settings_data.get("calendarUrl") or "").strip()
@@ -242,6 +257,7 @@ class AppState:
             calendarDoneKeys=done_keys,
             calendarLastSync=data.get("calendarLastSync"),
             calendarLastError=data.get("calendarLastError"),
+            notifiedKeys=notified_keys,
         )
 
 

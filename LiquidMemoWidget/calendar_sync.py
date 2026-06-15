@@ -75,13 +75,15 @@ def parse_feed(ics_text: str, days: int, now: datetime | None = None,
             continue
         start_iso, all_day = _to_local(dtstart.dt)
         summary = str(component.get("SUMMARY") or "（无标题）").strip()
+        location = str(component.get("LOCATION") or "").strip()
         uid = str(component.get("UID") or summary)
         key = f"{feed_id}|{uid}|{start_iso}" if feed_id else f"{uid}|{start_iso}"
         if key in seen:
             continue
         seen.add(key)
         events.append(CalendarEvent(
-            uid=uid, summary=summary, start=start_iso, allDay=all_day, key=key, feedId=feed_id,
+            uid=uid, summary=summary, start=start_iso, location=location,
+            allDay=all_day, key=key, feedId=feed_id,
         ))
 
     events.sort(key=lambda event: event.start)
