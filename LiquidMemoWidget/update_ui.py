@@ -20,11 +20,25 @@ from qfluentwidgets import (
 )
 
 import updater
-from ui_common import FONT_STACK_QSS, add_soft_shadow
+from ui_common import (
+    FONT_STACK_QSS,
+    add_soft_shadow,
+    enlarge_control_font,
+    set_label_font,
+)
 from version import APP_VERSION, GITHUB_URL
 
 if TYPE_CHECKING:
     from app import LiquidMemoApp
+
+
+# Update dialogs are glanced at and matter (a release prompt / the post-update notes), so the
+# type is deliberately large and clearly readable — bigger than the settings rows.
+UPDATE_TITLE_PX = 28
+UPDATE_SUBTITLE_PX = 19
+UPDATE_NOTES_PX = 19
+UPDATE_STATUS_PX = 17
+UPDATE_BUTTON_PX = 19
 
 
 class _ReleaseCardDialog(QDialog):
@@ -50,15 +64,19 @@ class _ReleaseCardDialog(QDialog):
         )
         add_soft_shadow(self.frame, blur=34, y=12, alpha=80)
         self.body = QVBoxLayout(self.frame)
-        self.body.setContentsMargins(28, 24, 28, 24)
-        self.body.setSpacing(14)
+        self.body.setContentsMargins(34, 30, 34, 30)
+        self.body.setSpacing(18)
 
     def add_header(self, title: str, subtitle: str) -> None:
         titles = QVBoxLayout()
-        titles.setSpacing(4)
+        titles.setSpacing(8)
         title_label = TitleLabel(title)
+        set_label_font(title_label, UPDATE_TITLE_PX)
         subtitle_label = BodyLabel(subtitle)
-        subtitle_label.setStyleSheet("color: rgba(17,24,32,150);")
+        subtitle_label.setWordWrap(True)
+        subtitle_label.setStyleSheet(
+            f"{FONT_STACK_QSS} color: rgba(17,24,32,165); font-size: {UPDATE_SUBTITLE_PX}px;"
+        )
         titles.addWidget(title_label)
         titles.addWidget(subtitle_label)
         self.body.addLayout(titles)
@@ -84,8 +102,8 @@ class _ReleaseCardDialog(QDialog):
         notes.setOpenExternalLinks(True)
         notes.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         notes.setStyleSheet(
-            f"{FONT_STACK_QSS} color: rgb(24,32,40); font-size: 13px;"
-            " background: transparent; padding: 14px;"
+            f"{FONT_STACK_QSS} color: rgb(24,32,40); font-size: {UPDATE_NOTES_PX}px;"
+            " background: transparent; padding: 18px;"
         )
         scroll.setWidget(notes)
         self.body.addWidget(scroll, 1)
@@ -116,7 +134,7 @@ class _DownloadTask(QRunnable):
 
 class UpdateDialog(_ReleaseCardDialog):
     def __init__(self, app: "LiquidMemoApp", release: updater.ReleaseInfo) -> None:
-        super().__init__(520, 560)
+        super().__init__(680, 740)
         self.app = app
         self.release = release
         self._downloading = False
@@ -130,16 +148,25 @@ class UpdateDialog(_ReleaseCardDialog):
         self.progress.hide()
         self.body.addWidget(self.progress)
         self.status = BodyLabel("")
-        self.status.setStyleSheet("color: rgba(17,24,32,150); font-size: 12px;")
+        self.status.setStyleSheet(
+            f"{FONT_STACK_QSS} color: rgba(17,24,32,160); font-size: {UPDATE_STATUS_PX}px;"
+        )
         self.status.hide()
         self.body.addWidget(self.status)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(12)
         buttons.addStretch()
         self.later = PushButton("稍后再说", self.frame)
+        self.later.setMinimumWidth(130)
+        self.later.setFixedHeight(42)
+        enlarge_control_font(self.later, UPDATE_BUTTON_PX)
         self.later.clicked.connect(self.close)
         buttons.addWidget(self.later)
         self.install = PrimaryPushButton("立即更新", self.frame, FluentIcon.UPDATE)
+        self.install.setMinimumWidth(150)
+        self.install.setFixedHeight(42)
+        enlarge_control_font(self.install, UPDATE_BUTTON_PX)
         self.install.clicked.connect(self._start)
         buttons.addWidget(self.install)
         self.body.addLayout(buttons)
@@ -196,13 +223,16 @@ class UpdateDialog(_ReleaseCardDialog):
 
 class ChangelogDialog(_ReleaseCardDialog):
     def __init__(self, notes: str, html: bool = False) -> None:
-        super().__init__(520, 520)
+        super().__init__(660, 680)
         self.setWindowTitle("更新日志")
         self.add_header("更新完成 🎉", f"桌面备忘已更新到 v{APP_VERSION}，本次更新内容：")
         self.add_notes(notes, html)
         buttons = QHBoxLayout()
         buttons.addStretch()
         ok = PrimaryPushButton("知道了", self.frame, FluentIcon.ACCEPT)
+        ok.setMinimumWidth(150)
+        ok.setFixedHeight(42)
+        enlarge_control_font(ok, UPDATE_BUTTON_PX)
         ok.clicked.connect(self.close)
         buttons.addWidget(ok)
         self.body.addLayout(buttons)
