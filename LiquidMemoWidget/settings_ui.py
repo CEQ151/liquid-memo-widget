@@ -6,11 +6,13 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QPoint, QSize, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
+    QLabel,
     QListWidget,
     QListWidgetItem,
     QStackedWidget,
@@ -55,8 +57,9 @@ from ui_common import (
     enlarge_control_font,
     set_label_font,
 )
+from skin_editor import CropDialog, export_crop, image_open_filter, load_skin_pixmap
 from startup import is_startup_enabled, set_startup
-from state_store import CalendarFeed, Settings
+from state_store import CalendarFeed, CustomSkin, Settings, skins_dir
 from version import APP_VERSION, GITHUB_URL
 
 if TYPE_CHECKING:
@@ -166,11 +169,14 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         self._section("外观")
         self.skin = self._combo_row(
             "皮肤",
-            "磨砂玻璃更省性能、文字更易读，推荐低配电脑使用；液态玻璃为实时折射特效。",
+            "磨砂玻璃更省性能、文字更易读，推荐低配电脑使用；液态玻璃为实时折射特效；"
+            "图片皮肤使用你上传的图片作为静态背景。",
             {"磨砂玻璃（推荐）": "acrylic", "液态玻璃": "glass"},
             self.app.state.settings.skin,
         )
+        self._refresh_skin_combo()  # append any saved image skins + select the active one
         self.skin.currentIndexChanged.connect(self._apply)
+        self._image_skins_card()
         self.opacity, self.opacity_value = self._slider_row("透明光泽", "控制玻璃底色染色强度，越低越通透。", int(self.app.state.settings.glassOpacity * 100), 0, 38, "%")
         self.opacity.valueChanged.connect(lambda value: self._slider_changed(self.opacity_value, value, "%"))
         self.strength, self.strength_value = self._slider_row("液态强度", "调节边缘折射、色散和高光的存在感。", int(self.app.state.settings.liquidStrength * 100), 20, 140, "%")
@@ -591,6 +597,151 @@ class SettingsWindow(FramelessDragMixin, QDialog):
     def _control_color(self, control: QWidget, fallback: str) -> str:
         return str(control.property("selectedColor") or fallback)
 
+    # ── Image skins (custom background pictures) ──────────────────────────────────────────
+    def _refresh_skin_combo(self) -> None:
+        """Rebuild the skin picker: the two built-ins plus one entry per saved image skin. The
+        built-ins are always present and never removable; image skins reflect customSkins. Run
+        with signals blocked so rebuilding never fires _apply."""
+        combo = self.skin
+        blocked = combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("磨砂玻璃（推荐）", userData="acrylic")
+        combo.addItem("液态玻璃", userData="glass")
+        for skin in self.app.state.settings.customSkins:
+            combo.addItem(skin.name or "未命名图片", userData=f"image:{skin.id}")
+        index = combo.findData(self.app.state.settings.skin)
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(blocked)
+
+    def _image_skins_card(self) -> None:
+        """Management card for image skins: a preview/list with per-row delete plus an add
+        button that drives the upload → crop → name → save flow. Mirrors _feeds_card."""
+        card = CardWidget()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 12, 18, 14)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        title = BodyLabel("图片皮肤")
+        set_label_font(title, SETTING_ROW_TITLE_FONT_PX)
+        header.addWidget(title)
+        info = TransparentToolButton(FluentIcon.INFO, card)
+        info.setFixedSize(26, 26)
+        info.setIconSize(QSize(16, 16))
+        info.setCursor(Qt.WhatsThisCursor)
+        info.setToolTip(
+            "上传一张图片并裁切，保存为静态背景皮肤；保存后可在上方「皮肤」中选择。"
+            "内置的磨砂玻璃 / 液态玻璃不可删除。"
+        )
+        info.installEventFilter(InfoToolTipFilter(info, showDelay=200, position=ToolTipPosition.TOP))
+        header.addWidget(info)
+        header.addStretch()
+        layout.addLayout(header)
+
+        self.skin_rows_layout = QVBoxLayout()
+        self.skin_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.skin_rows_layout.setSpacing(4)
+        layout.addLayout(self.skin_rows_layout)
+
+        add_row = QHBoxLayout()
+        add_row.addStretch()
+        add_button = PushButton("添加图片皮肤", card, FluentIcon.ADD)
+        enlarge_control_font(add_button)
+        add_button.clicked.connect(self._add_image_skin)
+        add_row.addWidget(add_button)
+        layout.addLayout(add_row)
+
+        self.form.addWidget(card)
+        self.refresh_image_skin_list()
+
+    def refresh_image_skin_list(self) -> None:
+        if not hasattr(self, "skin_rows_layout"):
+            return
+        while self.skin_rows_layout.count():
+            item = self.skin_rows_layout.takeAt(0)
+            if item.widget():
+                item.widget().hide()  # deleteLater is deferred; hide now so rows never overlap
+                item.widget().deleteLater()
+        skins = self.app.state.settings.customSkins
+        if not skins:
+            empty = BodyLabel("尚未添加图片皮肤")
+            empty.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,120); font-size: {SETTING_STATUS_FONT_PX}px;")
+            self.skin_rows_layout.addWidget(empty)
+            return
+        for skin in skins:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 4, 0, 4)
+            row_layout.setSpacing(12)
+            thumb = QLabel()
+            thumb.setFixedSize(72, 44)
+            thumb.setStyleSheet("background: rgba(17,24,32,20); border-radius: 6px;")
+            pixmap = load_skin_pixmap(skin.image_path())
+            if pixmap is not None:
+                scaled = pixmap.scaled(72, 44, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                thumb.setPixmap(scaled.copy((scaled.width() - 72) // 2, (scaled.height() - 44) // 2, 72, 44))
+            name = BodyLabel(skin.name or "未命名图片")
+            set_label_font(name, SETTING_CONTROL_FONT_PX)
+            remove = TransparentToolButton(FluentIcon.DELETE, row)
+            remove.setFixedSize(28, 28)
+            remove.setIconSize(QSize(15, 15))
+            remove.setToolTip("删除此图片皮肤（无法恢复）")
+            remove.installEventFilter(ToolTipFilter(remove, showDelay=300, position=ToolTipPosition.TOP))
+            remove.clicked.connect(lambda _checked=False, sid=skin.id: self._delete_image_skin(sid))
+            row_layout.addWidget(thumb)
+            row_layout.addWidget(name, 1)
+            row_layout.addWidget(remove)
+            self.skin_rows_layout.addWidget(row)
+
+    def _add_image_skin(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", image_open_filter())
+        if not path:
+            return
+        source = QPixmap(path)
+        if source.isNull():
+            return  # unreadable / unsupported file — silently ignore, the picker filters by type
+        window = self.app.window
+        aspect = (window.width() / window.height()) if (window and window.height()) else 1.4
+        dialog = CropDialog(source, aspect, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        skin = CustomSkin(name=dialog.skin_name)
+        skin.file = f"{skin.id}.png"
+        if not export_crop(dialog.canvas, skins_dir() / skin.file):
+            return
+        self.app.state.settings.customSkins.append(skin)
+        self.app.save()
+        self._refresh_skin_combo()
+        self.refresh_image_skin_list()
+        # Auto-select the new skin; the index change fires _apply, which applies the image skin.
+        index = self.skin.findData(f"image:{skin.id}")
+        if index >= 0:
+            self.skin.setCurrentIndex(index)
+
+    def _delete_image_skin(self, skin_id: str) -> None:
+        settings = self.app.state.settings
+        skin = next((s for s in settings.customSkins if s.id == skin_id), None)
+        if skin is None:
+            return
+        try:
+            image_path = skin.image_path()
+            if image_path.exists():
+                image_path.unlink()
+        except OSError:
+            pass
+        settings.customSkins = [s for s in settings.customSkins if s.id != skin_id]
+        was_active = settings.skin == f"image:{skin_id}"
+        if was_active:
+            settings.skin = "acrylic"  # deleting the live skin falls back to the frost skin
+        self.app.save()
+        self._refresh_skin_combo()
+        self.refresh_image_skin_list()
+        if was_active:
+            # The combo now points at acrylic (signals blocked during rebuild), so re-render the
+            # window directly rather than relying on a currentIndexChanged that won't fire.
+            self.app.window.apply_settings()
+
     def sync_from_state(self) -> None:
         settings = self.app.state.settings
         blockers = [
@@ -607,7 +758,7 @@ class SettingsWindow(FramelessDragMixin, QDialog):
             self.calendar_enabled.blockSignals(True),
             self.calendar_days.blockSignals(True),
         ]
-        self.skin.setCurrentIndex(max(0, self.skin.findData(settings.skin)))
+        self._refresh_skin_combo()  # rebuild entries (custom skins may have changed) + reselect
         self.opacity.setValue(int(settings.glassOpacity * 100))
         self.opacity_value.setText(f"{self.opacity.value()}%")
         self.strength.setValue(int(settings.liquidStrength * 100))
@@ -626,6 +777,7 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         self.calendar_enabled.setChecked(settings.calendarEnabled)
         self.calendar_days.setValue(settings.calendarSyncDays)
         self.refresh_feed_list()
+        self.refresh_image_skin_list()
         self.refresh_calendar_status()
         for widget, blocked in zip(
             [self.skin, self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup,

@@ -24,7 +24,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QCursor, QFontMetrics
+from PySide6.QtGui import QColor, QCursor, QFontMetrics, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -70,6 +70,7 @@ from WindowsLiquidGlass.src.GPUSharderWidget.one_d3d_widget import (  # noqa: E4
 )
 
 from liquid_effects import build_effect_params, color_overlay_strength
+from skin_editor import load_skin_pixmap, mean_luminance as image_mean_luminance
 from state_store import CalendarEvent, Settings, StateStore, TodoItem, parse_ddl, utc_now
 from wheel_hook import GlobalWheelHook
 from window_layer import (
@@ -956,6 +957,56 @@ ACRYLIC_TEXT_DARK = "#1B2127"
 ACRYLIC_TEXT_LIGHT = "#E8ECEF"
 
 
+class ImageSkin:
+    """User image-background skin: a static, cover-scaled image painted below the content layer.
+    Like AcrylicSkin there is no GPU screen capture and no effect chain — the window IS the
+    surface (geometry_scale = 1.0, content fills it), rounded by DWM. `image_path` is the
+    resolved PNG under state_store.skins_dir(); a missing image makes _make_skin fall back to
+    AcrylicSkin so this always points at a readable file when live."""
+
+    kind = "image"
+    geometry_scale = 1.0
+    radius_ratio = 0.0
+    corner_margin = 14
+    uses_glass = False
+
+    def __init__(self, image_path: "Path | None" = None) -> None:
+        self.image_path = image_path
+
+    def vertical_padding(self, height: int) -> int:
+        return 0
+
+    def horizontal_padding(self, width: int) -> int:
+        return 0
+
+
+class _ImageBackground(QWidget):
+    """Cover-scaled static image painted below the (capture-excluded) content layer for the image
+    skin. Transparent to mouse so the window's native hit-testing still governs clicks; the DWM
+    rounded corners clip it to shape, exactly as the acrylic frost is clipped."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._pixmap = QPixmap()
+
+    def set_image(self, pixmap: QPixmap | None) -> None:
+        self._pixmap = pixmap if (pixmap is not None and not pixmap.isNull()) else QPixmap()
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        if self._pixmap.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        rect = self.rect()
+        # Cover: scale to fill, center-crop the overflow (no distortion, no blank bars).
+        scaled = self._pixmap.scaled(rect.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        x = (scaled.width() - rect.width()) // 2
+        y = (scaled.height() - rect.height()) // 2
+        painter.drawPixmap(rect, scaled, QRect(x, y, rect.width(), rect.height()))
+
+
 class MemoWindow(OneGPUWidget):
     def __init__(self, app: "LiquidMemoApp") -> None:
         super().__init__(qt_move=False)
@@ -967,6 +1018,11 @@ class MemoWindow(OneGPUWidget):
         self._window_effect = WindowsWindowEffect(self)
         self._acrylic_applied = False
         self._acrylic_signature: str | None = None
+        # Image-skin (static background) state. _image_bg paints the cover-scaled image below the
+        # content layer; _image_luminance drives the deterministic dark/light text choice.
+        self._image_bg: _ImageBackground | None = None
+        self._image_pixmap: QPixmap | None = None
+        self._image_luminance: float = 1.0
         self.setWindowTitle("桌面备忘")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -1023,8 +1079,14 @@ class MemoWindow(OneGPUWidget):
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._hide_docked)
 
+    def _is_static_skin(self) -> bool:
+        """True for the non-capture skins (acrylic frost or static image), where text color is
+        deterministic and there is no live desktop sampling to drive auto-contrast."""
+        skin = self.app.state.settings.skin
+        return skin == "acrylic" or skin.startswith("image:")
+
     def schedule_contrast_refresh(self, delay: int = 180) -> None:
-        if self.app.state.settings.skin == "acrylic" or self.app.state.settings.fontColorMode == "manual":
+        if self._is_static_skin() or self.app.state.settings.fontColorMode == "manual":
             return
         self._contrast_refresh_timer.start(delay)
 
@@ -1145,8 +1207,8 @@ class MemoWindow(OneGPUWidget):
         # window's region; the stock loop presented those directly, which is the visible
         # black<->transparent flicker. Here every captured frame is read back and checked
         # first — a blank frame is dropped and the last good output stays on screen.
-        if self._active_skin_kind == "acrylic":
-            return  # frosted skin does no screen capture; the DWM acrylic follows the window
+        if self._active_skin_kind in ("acrylic", "image"):
+            return  # static skins do no screen capture; the frost / image follows the window
         d3d = self._d3d
         if not d3d._presenter_id or d3d._capture_w <= 0 or d3d._capture_h <= 0:
             return
@@ -1210,9 +1272,10 @@ class MemoWindow(OneGPUWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        # In frosted mode the D3D surface is never presented; hide it before the first paint so
-        # its blank swapchain doesn't flash over the acrylic before apply_settings runs.
-        if self.app.state.settings.skin == "acrylic" and not self._d3d.isHidden():
+        # In the static skins (frost / image) the D3D surface is never presented; hide it before
+        # the first paint so its blank swapchain doesn't flash over the background before
+        # apply_settings runs.
+        if self._is_static_skin() and not self._d3d.isHidden():
             self._d3d.hide()
         # Keep our own text/control layer out of the GPU screen capture. Otherwise
         # the next liquid-glass frame captures and refracts the text itself.
@@ -1257,6 +1320,13 @@ class MemoWindow(OneGPUWidget):
             QTimer.singleShot(0, self.protect_content_layer)
             self.app.save_later()
             self.schedule_contrast_refresh(80)
+
+    def resizeEvent(self, event) -> None:
+        # The base resizeEvent syncs the D3D child + capture rect; the image layer (a sibling
+        # child) must track the window the same way so the static background always fills it.
+        super().resizeEvent(event)
+        if self._image_bg is not None:
+            self._image_bg.setGeometry(0, 0, self.width(), self.height())
 
     def nativeEvent(self, event_type, message):
         if event_type == b"windows_generic_MSG":
@@ -1315,8 +1385,8 @@ class MemoWindow(OneGPUWidget):
         if self._is_window_moving:
             return
         self._is_window_moving = True
-        if self._active_skin_kind == "acrylic":
-            return  # the frost follows the window via DWM — no capture loop to spin up
+        if self._active_skin_kind in ("acrylic", "image"):
+            return  # frost / image follow the window — no capture loop to spin up
         self._contrast_was_active = self._contrast_timer.isActive()
         self._contrast_timer.stop()
         self.refresh_capture_after_idle()
@@ -1329,7 +1399,7 @@ class MemoWindow(OneGPUWidget):
         self.app.state.window.x = self.x()
         self.app.state.window.y = self.y()
         self.app.save_later()
-        if self._active_skin_kind == "acrylic":
+        if self._active_skin_kind in ("acrylic", "image"):
             self.protect_content_layer()
             self._maybe_dock()
             return
@@ -1555,14 +1625,28 @@ class MemoWindow(OneGPUWidget):
         self.move(x, y)
 
     def _make_skin(self, skin_name: str):
-        return AcrylicSkin() if skin_name == "acrylic" else GlassSkin()
+        if skin_name == "acrylic":
+            return AcrylicSkin()
+        if skin_name.startswith("image:"):
+            skin_id = skin_name[len("image:"):]
+            custom = next((s for s in self.app.state.settings.customSkins if s.id == skin_id), None)
+            if custom is not None and custom.image_path().exists():
+                return ImageSkin(custom.image_path())
+            return AcrylicSkin()  # missing/deleted image -> safe fallback to the frost skin
+        return GlassSkin()
 
     def apply_settings(self, refresh_rows: bool = False, reset_capture: bool = False) -> None:
         settings = self.app.state.settings
-        skin_changed = self._active_skin_kind not in (None, settings.skin)
+        # _make_skin already resolves a missing image skin down to AcrylicSkin, so branch on the
+        # resolved skin's kind (not the raw "image:<id>" string) for both dispatch and change
+        # detection — otherwise "image" never equals "image:<id>" and skin_changed misfires.
         self.skin = self._make_skin(settings.skin)
-        if settings.skin == "acrylic":
+        new_kind = self.skin.kind
+        skin_changed = self._active_skin_kind not in (None, new_kind)
+        if new_kind == "acrylic":
             self._apply_acrylic_mode()
+        elif new_kind == "image":
+            self._apply_image_mode()
         else:
             self._apply_glass_mode(reset_capture)
         # The two skins use different content insets/geometry (glass padding vs acrylic
@@ -1577,9 +1661,13 @@ class MemoWindow(OneGPUWidget):
     def _apply_glass_mode(self, reset_capture: bool = False) -> None:
         settings = self.app.state.settings
         if self._active_skin_kind not in (None, "glass"):
-            # Coming back from acrylic: drop the frost, re-show the D3D surface, and rebuild the
-            # capture pipeline (it was stopped / went stale while frosted).
+            # Coming back from acrylic/image: drop the frost or hide the image layer, re-show the
+            # D3D surface, and rebuild the capture pipeline (stopped / stale while static).
             self._remove_acrylic()
+            self._hide_image_bg()
+            # Glass rounds itself via the SDF, not DWM; clear the DWM corner rounding the image
+            # skin turned on (acrylic exit clears it too, but only when acrylic was applied).
+            set_rounded_corners(int(self.winId()), False)
             self._d3d.show()
             reset_capture = True
         self._active_skin_kind = "glass"
@@ -1624,9 +1712,44 @@ class MemoWindow(OneGPUWidget):
         self._active_skin_kind = "acrylic"
         self._contrast_timer.stop()
         self.stop()
+        self._hide_image_bg()
         if not self._d3d.isHidden():
             self._d3d.hide()
         self._apply_acrylic_effect()
+        self.apply_text_colors()
+
+    def _ensure_image_bg(self) -> "_ImageBackground":
+        if self._image_bg is None:
+            self._image_bg = _ImageBackground(self)
+            self._image_bg.setGeometry(0, 0, self.width(), self.height())
+        return self._image_bg
+
+    def _hide_image_bg(self) -> None:
+        if self._image_bg is not None:
+            self._image_bg.hide()
+
+    def _apply_image_mode(self) -> None:
+        # Static image surface: like acrylic there is no screen capture, effect chain or contrast
+        # sampling. The D3D child is hidden; _image_bg paints the cover-scaled image below the
+        # (capture-excluded) content layer, and DWM rounds the window corners.
+        self._active_skin_kind = "image"
+        self._contrast_timer.stop()
+        self.stop()
+        self._remove_acrylic()
+        if not self._d3d.isHidden():
+            self._d3d.hide()
+        path = getattr(self.skin, "image_path", None)
+        pixmap = load_skin_pixmap(path) if path is not None else None
+        self._image_pixmap = pixmap
+        self._image_luminance = image_mean_luminance(pixmap) if pixmap is not None else 1.0
+        image_bg = self._ensure_image_bg()
+        image_bg.set_image(pixmap)
+        image_bg.setGeometry(0, 0, self.width(), self.height())
+        image_bg.show()
+        image_bg.lower()  # beneath the content layer; container is raised back on top below
+        if self.container:
+            self.container.raise_()
+        set_rounded_corners(int(self.winId()), True)
         self.apply_text_colors()
 
     def _apply_acrylic_effect(self) -> None:
@@ -1759,12 +1882,20 @@ class MemoWindow(OneGPUWidget):
         tint = qcolor(self.app.state.settings.windowTint, "#F2F4F7")
         return best_contrast_color(tint, [ACRYLIC_TEXT_DARK, ACRYLIC_TEXT_LIGHT])
 
+    def _image_text_color(self) -> QColor:
+        # Image mode has no live capture to sample, so contrast is deterministic: soft dark text
+        # on a bright image, soft light text on a dark one (reusing the acrylic text palette).
+        dark, light = qcolor(ACRYLIC_TEXT_DARK), qcolor(ACRYLIC_TEXT_LIGHT)
+        return dark if self._image_luminance > 0.55 else light
+
     def _normal_text_color(self) -> QColor:
         settings = self.app.state.settings
         if settings.skin == "acrylic":
-            return self._acrylic_text_color()
+            return self._acrylic_text_color()  # frost ignores manual mode (deterministic by tint)
         if settings.fontColorMode == "manual":
             return qcolor(settings.todoTextColor)
+        if settings.skin.startswith("image:"):
+            return self._image_text_color()
         return QColor(self._auto_text_color)
 
     def text_color_for(self, todo: TodoItem) -> QColor:
@@ -1774,8 +1905,8 @@ class MemoWindow(OneGPUWidget):
 
     def text_needs_halo(self) -> bool:
         settings = self.app.state.settings
-        if settings.skin == "acrylic":
-            return False  # the frost is already a calm, even surface — no protective halo
+        if self._is_static_skin():
+            return False  # frost / static image are even surfaces with deterministic text — no halo
         if settings.fontColorMode == "manual":
             return False
         return settings.fontColorMode == "autoEnhanced" or self._background_extremely_busy
@@ -1795,7 +1926,7 @@ class MemoWindow(OneGPUWidget):
         self.empty.setStyleSheet(f"{FONT_STACK_QSS} color: {css_rgba(normal, 0.58)}; font-size: 15px;")
 
     def update_auto_contrast(self, force: bool = False) -> None:
-        if not self.isVisible() or self.app.state.settings.skin == "acrylic":
+        if not self.isVisible() or self._is_static_skin():
             return
         if self.app.state.settings.fontColorMode == "manual":
             return

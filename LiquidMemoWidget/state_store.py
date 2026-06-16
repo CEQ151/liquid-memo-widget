@@ -12,6 +12,15 @@ from uuid import uuid4
 
 APP_DIR = Path.home() / "AppData" / "Roaming" / "DesktopMemo_Pro"
 STATE_PATH = APP_DIR / "liquid-state.json"
+# User-uploaded background images for custom image skins. Kept beside the state file (a
+# per-user, writable, backed-up location) rather than under the read-only bundled assets dir.
+SKINS_DIR = APP_DIR / "skins"
+
+
+def skins_dir() -> Path:
+    """Return the custom-skin image directory, creating it on first use."""
+    SKINS_DIR.mkdir(parents=True, exist_ok=True)
+    return SKINS_DIR
 
 
 def utc_now() -> str:
@@ -127,11 +136,40 @@ class CalendarFeed:
 
 
 @dataclass
+class CustomSkin:
+    """A user-created image-background skin. The selected-skin string for one of these is
+    `f"image:{id}"`. `file` is just the filename (no directory) of the cropped PNG under
+    `skins_dir()`; it is resolved to an absolute path at render time so the saved state stays
+    portable across machines/installs."""
+
+    id: str = field(default_factory=lambda: str(uuid4()))
+    name: str = ""
+    file: str = ""  # filename only, under SKINS_DIR
+    fit: str = "cover"  # reserved; only "cover" is implemented today
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "CustomSkin":
+        return CustomSkin(
+            id=str(data.get("id") or uuid4()),
+            name=str(data.get("name") or ""),
+            file=str(data.get("file") or ""),
+            fit=str(data.get("fit") or "cover"),
+        )
+
+    def image_path(self) -> Path:
+        return SKINS_DIR / self.file
+
+
+@dataclass
 class Settings:
     # Rendering skin. "acrylic" is a lightweight DWM frosted-glass surface (no GPU screen
     # capture) for low-end PCs and is the default; "glass" is the original real-time D3D
-    # liquid-glass refraction. Any other value normalizes to "acrylic" in from_dict.
+    # liquid-glass refraction; "image:<id>" selects a user-created CustomSkin (a static image
+    # background, see customSkins). Any unrecognized value normalizes to "acrylic" in from_dict.
     skin: str = "acrylic"
+    # User-created image-background skins, each selectable as "image:<id>". The built-in
+    # acrylic/glass skins are not in this list and cannot be deleted.
+    customSkins: list[CustomSkin] = field(default_factory=list)
     glassOpacity: float = 0.0
     liquidStrength: float = 1.0
     windowTint: str = "#FFFFFF"
@@ -167,6 +205,13 @@ class Settings:
     def active_calendar_feeds(self) -> list[CalendarFeed]:
         """Feeds that are checked and have a URL — the only ones synced and displayed."""
         return [feed for feed in self.calendarFeeds if feed.enabled and feed.url.strip()]
+
+    def active_custom_skin(self) -> "CustomSkin | None":
+        """The CustomSkin selected by `skin` ("image:<id>"), or None for a built-in skin."""
+        if not self.skin.startswith("image:"):
+            return None
+        skin_id = self.skin[len("image:"):]
+        return next((s for s in self.customSkins if s.id == skin_id), None)
 
 
 @dataclass
@@ -222,12 +267,15 @@ class AppState:
         settings = Settings(**{key: settings_data.get(key, value) for key, value in settings_defaults.items()})
         if settings.layerMode != "alwaysVisibleClickThrough":
             settings.layerMode = "alwaysVisibleClickThrough"
-        if settings.skin not in ("acrylic", "glass"):
+        # The generic loop above leaves dataclass lists as raw dicts; rebuild them typed
+        # (customSkins first so the skin whitelist below can validate an "image:<id>" against it).
+        settings.customSkins = [CustomSkin.from_dict(item) for item in settings_data.get("customSkins") or []]
+        valid_skins = {"acrylic", "glass"} | {f"image:{s.id}" for s in settings.customSkins}
+        if settings.skin not in valid_skins:
             settings.skin = "acrylic"
         settings.calendarSyncDays = max(1, min(30, int(settings.calendarSyncDays or 7)))
         settings.notificationsEnabled = bool(settings.notificationsEnabled)
         settings.notifyMinutesBefore = max(1, min(1440, int(settings.notifyMinutesBefore or 15)))
-        # The generic loop above leaves dataclass lists as raw dicts; rebuild them typed.
         settings.calendarFeeds = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeeds") or []]
         settings.calendarFeedArchive = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeedArchive") or []]
         window = WindowState(**{key: window_data.get(key, value) for key, value in window_defaults.items()})
