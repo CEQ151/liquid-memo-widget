@@ -219,7 +219,10 @@ class UpdateDialog(_ReleaseCardDialog):
         self.app.state.settings.pendingUpdateVersion = self.release.version
         self.app.save()
         updater.install_and_restart(Path(path))
-        QTimer.singleShot(600, self.app.quit)
+        # The helper is already detached before this returns; close the UI immediately and stop
+        # runtime timers/tasks. Its watchdog can terminate a thread-pool-stuck process after a
+        # short grace period, but the common path remains a clean Qt shutdown.
+        QTimer.singleShot(0, self.app.quit_for_update)
 
     def _on_failed(self, message: str) -> None:
         self._downloading = False

@@ -161,9 +161,12 @@ In-app update over GitHub Releases: `updater.py` is Qt-free network/process logi
 `update_ui.py` owns the dialogs and the `UpdateManager` orchestration. Flow: fetch latest release
 (GitHub API, falling back to the rate-limit-free `releases.atom` feed) → if newer, prompt with
 release notes → download the `-Setup-*.exe` to `%TEMP%` → **verify SHA256** → spawn a detached
-`--apply-update` helper (this same exe) that waits for the app to exit, runs the Inno installer
-silently, and relaunches. `pendingUpdateVersion` persists across the restart so a failed install
-surfaces a notice next launch.
+`--apply-update` helper (this same exe) that asks the app to shut down, waits briefly, and—only
+after verifying the stuck PID still belongs to that exact executable—force-terminates it if a Qt
+worker prevents process exit; it then runs the Inno installer silently and relaunches.
+`pendingUpdateVersion` persists across the restart so a failed install surfaces a notice next
+launch. The helper records checksum, exit, installer-return-code, and relaunch events in
+`%TEMP%\LiquidMemoWidget-update.log`.
 
 **Release-asset contract** (produced by `release.yml` / `Package.ps1`, consumed by `updater.py`):
 - `LiquidMemoWidget-Setup-vX.Y.Z.exe` + `.sha256` sidecar (`<hash>  <name>`, sha256sum layout)

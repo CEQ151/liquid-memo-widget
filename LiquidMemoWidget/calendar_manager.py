@@ -79,6 +79,10 @@ class CalendarManager:
             self._timer.start()
             self.sync_now()
 
+    def stop(self) -> None:
+        self._timer.stop()
+        self._debounce.stop()
+
     def on_settings_changed(self) -> None:
         settings = self.app.state.settings
         if settings.calendarEnabled and settings.active_calendar_feeds():

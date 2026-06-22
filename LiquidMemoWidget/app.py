@@ -16,6 +16,7 @@ from PySide6.QtCore import (
     QPoint,
     QPropertyAnimation,
     QRect,
+    QThreadPool,
     Qt,
     QTimer,
     Signal,
@@ -2209,8 +2210,37 @@ class LiquidMemoApp:
         self.save()
         self.qt.quit()
 
+    def quit_for_update(self) -> None:
+        """Make the visible app disappear promptly before the detached updater takes over.
+
+        Active QRunnables cannot be cancelled safely, so the helper still has a same-executable
+        watchdog for a worker that outlives Qt. Clearing queued work and stopping every manager
+        keeps the normal path graceful and avoids waiting on work that has not started yet.
+        """
+        self.save_timer.stop()
+        self.save()
+        for manager in (self.calendar, self.notifier, self.surprise, self.floating):
+            try:
+                manager.stop()
+            except Exception:
+                pass
+        QThreadPool.globalInstance().clear()
+        try:
+            self.tray.hide()
+        except Exception:
+            pass
+        for widget in self.qt.topLevelWidgets():
+            widget.hide()
+        self.qt.quit()
+
     def shutdown(self) -> None:
         self.save()
+        try:
+            self.calendar.stop()
+            self.notifier.stop()
+            self.surprise.stop()
+        except Exception:
+            pass
         try:
             self.floating.stop()
         except Exception:

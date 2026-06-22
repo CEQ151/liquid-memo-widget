@@ -29,6 +29,8 @@ _TIMEOUT = 15
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
 UPDATE_HELPER_FLAG = "--apply-update"
+GRACEFUL_EXIT_TIMEOUT_SECONDS = 8
+FORCED_EXIT_TIMEOUT_SECONDS = 5
 
 
 @dataclass
@@ -204,6 +206,7 @@ def verify_installer_checksum(path: Path, release: ReleaseInfo) -> None:
         raise RuntimeError("无法解析安装包校验文件")
     if sha256_file(path) != expected:
         raise RuntimeError("安装包校验失败（SHA256 不匹配），已中止更新")
+    _log(f"checksum verified for {release.installer_name}")
 
 
 def download_installer(release: ReleaseInfo,
@@ -303,11 +306,69 @@ def install_and_restart(installer: Path) -> None:
     with the parent); the caller MUST quit immediately after so the helper's
     PID-wait can proceed and the installer never starts while we still hold file
     locks."""
-    subprocess.Popen(
+    helper = subprocess.Popen(
         _helper_command(installer, os.getpid(), sys.executable),
         creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
         close_fds=True,
     )
+    _log(f"update helper pid {helper.pid} started for {Path(installer).name}; requesting app exit")
+
+
+def _process_image_path(pid: int) -> str | None:
+    """Return the executable path for `pid`, or None if it is already gone/unqueryable."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        query = kernel32.QueryFullProcessImageNameW
+        query.restype = wintypes.BOOL
+        query.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        if not query(handle, 0, buffer, ctypes.byref(size)):
+            return None
+        return buffer.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _terminate_pid(pid: int, expected_exe: str, timeout: float = FORCED_EXIT_TIMEOUT_SECONDS) -> bool:
+    """Terminate a stuck old app only after confirming its image is the expected executable."""
+    actual_exe = _process_image_path(pid)
+    if actual_exe is None:
+        return _wait_for_pid_exit(pid, 0)
+    actual = os.path.normcase(os.path.abspath(actual_exe))
+    expected = os.path.normcase(os.path.abspath(expected_exe))
+    if actual != expected:
+        _log(f"refusing to terminate pid {pid}: image mismatch ({actual_exe!r})")
+        return False
+
+    PROCESS_TERMINATE = 0x0001
+    SYNCHRONIZE = 0x00100000
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+    if not handle:
+        return _wait_for_pid_exit(pid, 0)
+    try:
+        if not kernel32.TerminateProcess(handle, 0):
+            return False
+        return kernel32.WaitForSingleObject(handle, int(timeout * 1000)) == 0
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def apply_update(installer: str, parent_pid: int, target_exe: str) -> None:
@@ -322,16 +383,22 @@ def apply_update(installer: str, parent_pid: int, target_exe: str) -> None:
     mirroring the old Start-Process path. The relaunch lives in `finally` so the
     app still comes back even if the install fails or the UAC prompt is declined."""
     installer_path = Path(installer)
-    if not _wait_for_pid_exit(parent_pid, 30):
-        _log(f"app pid {parent_pid} did not exit in time; aborting install of {installer_path.name}")
-        return  # app never exited; do not install over a live process or double-launch
+    if not _wait_for_pid_exit(parent_pid, GRACEFUL_EXIT_TIMEOUT_SECONDS):
+        _log(f"app pid {parent_pid} did not exit gracefully; requesting forced shutdown")
+        if not _terminate_pid(parent_pid, target_exe):
+            _log(f"could not stop app pid {parent_pid}; aborting install of {installer_path.name}")
+            return
+        _log(f"forced shutdown completed for app pid {parent_pid}")
+    else:
+        _log(f"app pid {parent_pid} exited gracefully")
     time.sleep(0.5)  # let the OS release file locks the app held
     try:
-        subprocess.run(
+        result = subprocess.run(
             [str(installer_path), *_installer_args(_update_log_path())],
             creationflags=CREATE_NO_WINDOW,
             check=False,
         )
+        _log(f"installer {installer_path.name} exited with code {result.returncode}")
     except Exception as exc:
         _log(f"installer launch failed for {installer_path.name}: {exc!r}")
     finally:
@@ -340,9 +407,10 @@ def apply_update(installer: str, parent_pid: int, target_exe: str) -> None:
         except Exception:
             pass
         try:
-            subprocess.Popen([target_exe], creationflags=DETACHED_PROCESS, close_fds=True)
-        except Exception:
-            pass
+            restarted = subprocess.Popen([target_exe], creationflags=DETACHED_PROCESS, close_fds=True)
+            _log(f"restarted app as pid {restarted.pid}")
+        except Exception as exc:
+            _log(f"app relaunch failed for {target_exe!r}: {exc!r}")
 
 
 def is_frozen() -> bool:

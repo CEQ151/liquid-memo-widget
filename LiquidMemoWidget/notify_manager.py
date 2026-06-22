@@ -52,6 +52,9 @@ class NotificationManager:
             pass
         self.check_now()
 
+    def stop(self) -> None:
+        self._timer.stop()
+
     def _on_message_clicked(self) -> None:
         try:
             self.app.window.show()

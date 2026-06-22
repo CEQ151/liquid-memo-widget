@@ -497,6 +497,10 @@ class SurpriseService:
         self._schedule_midnight()
         self.apply_theme()
 
+    def stop(self) -> None:
+        self._midnight_timer.stop()
+        self.note_dialog.hide()
+
     def activate(self, passphrase: str) -> None:
         envelope = read_envelope()
         key = key_from_passphrase(passphrase, envelope)
