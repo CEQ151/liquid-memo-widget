@@ -7,6 +7,7 @@ Pure network/process logic with no Qt dependency; the UI lives in app.py
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -40,6 +41,10 @@ class ReleaseInfo:
     installer_name: str
     installer_size: int
     notes_html: bool = False  # True when notes came from the atom feed (HTML)
+    # SHA256 sidecar for the installer (asset named "<installer>.sha256"). "" for older
+    # releases that predate checksum publishing — verification is then skipped (see
+    # download_installer). The atom fallback reconstructs the URL from the fixed naming.
+    checksum_url: str = ""
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -69,15 +74,17 @@ def _get_json(url: str) -> dict:
 
 def _release_from_payload(data: dict) -> ReleaseInfo:
     tag = str(data.get("tag_name") or "")
+    assets = {str(a.get("name") or ""): str(a.get("browser_download_url") or "")
+              for a in data.get("assets") or []}
+    sizes = {str(a.get("name") or ""): int(a.get("size") or 0) for a in data.get("assets") or []}
     installer_url = installer_name = ""
     installer_size = 0
-    for asset in data.get("assets") or []:
-        name = str(asset.get("name") or "")
+    for name, url in assets.items():
         if "-Setup-" in name and name.lower().endswith(".exe"):
-            installer_url = str(asset.get("browser_download_url") or "")
-            installer_name = name
-            installer_size = int(asset.get("size") or 0)
+            installer_url, installer_name, installer_size = url, name, sizes.get(name, 0)
             break
+    # The checksum sidecar is published as "<installer>.sha256" (absent on older releases).
+    checksum_url = assets.get(f"{installer_name}.sha256", "") if installer_name else ""
     return ReleaseInfo(
         tag=tag,
         version=tag.lstrip("vV"),
@@ -86,6 +93,7 @@ def _release_from_payload(data: dict) -> ReleaseInfo:
         installer_url=installer_url,
         installer_name=installer_name,
         installer_size=installer_size,
+        checksum_url=checksum_url,
     )
 
 
@@ -112,15 +120,17 @@ def _fetch_atom_releases() -> list[ReleaseInfo]:
             continue
         link = entry.find("a:link", ns)
         installer_name = f"LiquidMemoWidget-Setup-{tag}.exe"
+        download_base = f"{GITHUB_URL}/releases/download/{tag}"
         releases.append(ReleaseInfo(
             tag=tag,
             version=tag.lstrip("vV"),
             notes=entry.findtext("a:content", "", ns) or "",
             html_url=(link.get("href") if link is not None else None) or f"{GITHUB_URL}/releases",
-            installer_url=f"{GITHUB_URL}/releases/download/{tag}/{installer_name}",
+            installer_url=f"{download_base}/{installer_name}",
             installer_name=installer_name,
             installer_size=0,
             notes_html=True,
+            checksum_url=f"{download_base}/{installer_name}.sha256",
         ))
     if not releases:
         raise RuntimeError("无法从发布源获取版本信息")
@@ -151,9 +161,54 @@ def fetch_release_by_tag(tag: str) -> ReleaseInfo:
         raise api_error
 
 
+def sha256_file(path: Path) -> str:
+    """Streaming SHA256 of a file as a lowercase hex digest."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _parse_expected_sha256(text: str) -> str:
+    """Pull the hex digest out of a `.sha256` sidecar. Accepts the `sha256sum` layout
+    (`<hash>  <filename>`) or a bare hash; returns it lowercased, or "" if unparseable."""
+    for line in (text or "").splitlines():
+        token = line.strip().split()[0] if line.strip() else ""
+        if re.fullmatch(r"[0-9a-fA-F]{64}", token):
+            return token.lower()
+    return ""
+
+
+def verify_installer_checksum(path: Path, release: ReleaseInfo) -> None:
+    """Verify the downloaded installer against the release's `.sha256` sidecar.
+
+    A *fetched* hash that does not match aborts the update (corruption / tampering). But when
+    the sidecar can't be obtained — no `checksum_url`, or the fetch fails (older releases have
+    no sidecar; the atom fallback only reconstructs the URL by convention) — verification is
+    skipped: we have no trusted hash to compare against, and failing closed there would break
+    updates to/from those versions. (Strong provenance is the job of code signing, not this.)"""
+    if not release.checksum_url:
+        _log(f"no checksum sidecar for {release.installer_name}; skipping verification")
+        return
+    try:
+        request = urllib.request.Request(
+            release.checksum_url, headers={"User-Agent": f"{GITHUB_REPO}-updater"}
+        )
+        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
+            expected = _parse_expected_sha256(response.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        _log(f"checksum fetch failed for {release.installer_name}: {exc!r}; skipping verification")
+        return
+    if not expected:
+        raise RuntimeError("无法解析安装包校验文件")
+    if sha256_file(path) != expected:
+        raise RuntimeError("安装包校验失败（SHA256 不匹配），已中止更新")
+
+
 def download_installer(release: ReleaseInfo,
                        progress: Callable[[int, int], None] | None = None) -> Path:
-    """Download the Setup asset to %TEMP%; returns the local path."""
+    """Download the Setup asset to %TEMP%, verify its SHA256, and return the local path."""
     if not release.installer_url:
         raise RuntimeError("该版本没有提供安装包")
     dest = Path(tempfile.gettempdir()) / release.installer_name
@@ -174,11 +229,29 @@ def download_installer(release: ReleaseInfo,
                     progress(received, total)
     if total and received < total:
         raise RuntimeError("下载不完整，请重试")
+    try:
+        verify_installer_checksum(dest, release)
+    except Exception:
+        # Never leave an unverified / corrupt installer behind for a later run to pick up.
+        dest.unlink(missing_ok=True)
+        raise
     return dest
 
 
 def _update_log_path() -> Path:
     return Path(tempfile.gettempdir()) / "LiquidMemoWidget-update.log"
+
+
+def _log(message: str) -> None:
+    """Append a timestamped line to the update log (best-effort, never raises). The log is
+    the only postmortem trail for failed silent updates — UAC declines, installer errors,
+    checksum mismatches — so don't swallow these without recording them."""
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with _update_log_path().open("a", encoding="utf-8") as stream:
+            stream.write(f"[{stamp}] {message}\n")
+    except Exception:
+        pass
 
 
 def _installer_args(log_path: Path) -> list[str]:
@@ -250,6 +323,7 @@ def apply_update(installer: str, parent_pid: int, target_exe: str) -> None:
     app still comes back even if the install fails or the UAC prompt is declined."""
     installer_path = Path(installer)
     if not _wait_for_pid_exit(parent_pid, 30):
+        _log(f"app pid {parent_pid} did not exit in time; aborting install of {installer_path.name}")
         return  # app never exited; do not install over a live process or double-launch
     time.sleep(0.5)  # let the OS release file locks the app held
     try:
@@ -258,8 +332,8 @@ def apply_update(installer: str, parent_pid: int, target_exe: str) -> None:
             creationflags=CREATE_NO_WINDOW,
             check=False,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _log(f"installer launch failed for {installer_path.name}: {exc!r}")
     finally:
         try:
             installer_path.unlink(missing_ok=True)
@@ -273,3 +347,19 @@ def apply_update(installer: str, parent_pid: int, target_exe: str) -> None:
 
 def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
+
+
+# Marker file dropped beside the exe only in the portable zip (see Package.ps1 / release.yml).
+# The installer build never contains it, so its presence reliably distinguishes a portable
+# build from an installed one.
+PORTABLE_MARKER = "portable.flag"
+
+
+def is_portable_build() -> bool:
+    """True for the portable (no-install) build. Portable copies live in arbitrary, possibly
+    read-only locations (Desktop, USB, an unzipped folder), so they must not silently run the
+    Inno installer over themselves — the UI offers a manual download/release-page path instead."""
+    try:
+        return (Path(sys.executable).parent / PORTABLE_MARKER).exists()
+    except Exception:
+        return False

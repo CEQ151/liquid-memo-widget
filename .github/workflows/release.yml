@@ -91,13 +91,29 @@ jobs:
           if (Test-Path $zipPath) {
             Remove-Item $zipPath -Force
           }
+          # Marker so the runtime recognizes the portable build (manual update, not silent
+          # install). The installer was already built above, so it never contains this file.
+          "portable" | Set-Content -LiteralPath .\dist\LiquidMemoWidget\portable.flag -Encoding ascii -NoNewline
           Compress-Archive -Path .\dist\LiquidMemoWidget\* -DestinationPath $zipPath -CompressionLevel Optimal
+          Remove-Item .\dist\LiquidMemoWidget\portable.flag -Force
+
+      - name: Compute SHA256 checksums
+        shell: pwsh
+        run: |
+          # "<hash>  <filename>" sidecars (sha256sum layout); the in-app updater verifies the
+          # installer against its sidecar before running the silent install.
+          function Write-Sidecar($path) {
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower()
+            "$hash  $(Split-Path -Leaf $path)" | Set-Content -LiteralPath "$path.sha256" -Encoding ascii -NoNewline
+          }
+          Write-Sidecar ".\dist\installer\LiquidMemoWidget-Setup-${env:RELEASE_VERSION}.exe"
+          Write-Sidecar ".\dist\LiquidMemoWidget-Portable-${env:RELEASE_VERSION}.zip"
 
       - name: Verify artifacts
         shell: pwsh
         run: |
           Get-ChildItem .\dist -Recurse -File |
-            Where-Object { $_.Name -match '\.(exe|zip)$' } |
+            Where-Object { $_.Name -match '\.(exe|zip|sha256)$' } |
             Select-Object FullName, Length
 
       # The release body comes from this version's section in CHANGELOG.md, so every
@@ -145,4 +161,6 @@ jobs:
           generate_release_notes: true
           files: |
             dist/installer/LiquidMemoWidget-Setup-${{ env.RELEASE_VERSION }}.exe
+            dist/installer/LiquidMemoWidget-Setup-${{ env.RELEASE_VERSION }}.exe.sha256
             dist/LiquidMemoWidget-Portable-${{ env.RELEASE_VERSION }}.zip
+            dist/LiquidMemoWidget-Portable-${{ env.RELEASE_VERSION }}.zip.sha256

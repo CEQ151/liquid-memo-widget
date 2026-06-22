@@ -2,17 +2,16 @@
 
 # 🪟 Liquid Memo Widget
 
-**A "Liquid Glass" desktop memo & todo widget for Windows 11**
+**A translucent frosted-glass desktop memo & todo widget for Windows 11**
 
-A real-time GPU screen-capture widget: it continuously captures the desktop behind itself and
-refracts it through D3D11 effects, floating todos, deadlines, and calendar events on a
-translucent glass surface.
+A translucent DWM acrylic frost (or a custom static image background) floating todos, deadlines,
+and calendar events on the desktop.
 
 [中文](README.md) · English
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D6?logo=windows11&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Render](https://img.shields.io/badge/render-D3D11%20%2B%20Qt-5C2D91)
+![Render](https://img.shields.io/badge/render-DWM%20Acrylic%20%2B%20Qt-5C2D91)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 </div>
@@ -22,13 +21,15 @@ translucent glass surface.
 ## ✨ Features
 
 ### 🎨 Visuals
-- **Real-time liquid glass** powered by the local `WindowsLiquidGlass` D3D11 engine — it
-  continuously captures the desktop region behind the window and refracts it with flow,
-  chromatic aberration, and highlight effects.
-- **Adaptive text contrast** automatically samples background luminance and complexity to pick
-  dark/light text; over extremely busy backgrounds (terminals, text-heavy pages) it switches to
-  high-visibility neon colors, and `autoEnhanced` mode adds a soft halo behind text.
-- **Tunable glass** — adjust window tint, glass opacity, and liquid strength in settings.
+- **Frosted-glass skin (default)** — a translucent surface built on Windows' own DWM acrylic
+  effect: light on resources, crisp text, no GPU screen capture.
+- **Image background skin** — upload and crop an image to use as a static background skin,
+  switchable any time in settings.
+- **Tunable tint** — adjust the frost's low-saturation background tint and customize the normal /
+  urgent todo text colors.
+
+> Earlier versions also offered a real-time "liquid glass" D3D11 skin that captured and refracted
+> the desktop behind the window. It was removed (buggy and heavy on size).
 
 ### ✅ Todos
 - **Todo-focused surface** — quickly add and check off items; completed items archive or stay
@@ -46,15 +47,16 @@ translucent glass surface.
   no network; checked-off events stay remembered across re-syncs (dimmed + strikethrough).
 
 ### 🖱️ Desktop Interaction
-- **Click-through** — clicks over the glass pass through to the desktop; only checkboxes and
-  buttons capture input, so the widget never gets in your way.
-- **Native drag** — move the window via the `⋮⋮` handle; `-` minimizes and double-clicking the
-  corner icon restores it.
+- **Three display modes**: regular floating memo, sliding edge auto-hide, or an animated floating launcher that opens on click and retracts after the pointer leaves.
+- **Click-through** — clicks over the translucent surface pass through to the desktop; only
+  checkboxes and buttons capture input, so the widget never gets in your way.
+- **Native movement and sizing** — move via `⋮⋮`, resize collapsed mode from the bottom edge,
+  or freely drag the launcher and have its position remembered.
 - **Global wheel scroll** — scroll through content when it overflows.
 - **System tray** — tray menu for Settings, History, Show/Hide, and Exit.
 - **Launch at login** — toggle start-with-Windows in settings.
 
-> ⚠️ Windows-only (Win32 + D3D11); will not run or build on other platforms. UI strings are
+> ⚠️ Windows-only (Win32 + DWM); will not run or build on other platforms. UI strings are
 > Chinese; code identifiers are English.
 
 ---
@@ -128,12 +130,9 @@ Writes are atomic (temp file + replace); a corrupt file is backed up as
 
 ## 🙏 Acknowledgements
 
-This project integrates and adapts the liquid glass rendering core from
-[ai12989757/WindowsLiquidGlass](https://github.com/ai12989757/WindowsLiquidGlass).
-
-`WindowsLiquidGlass` provides the D3D screen-capture, rounded-rectangle SDF, GPU effect renderer,
-and Qt widget foundation used for the translucent Liquid Glass memo surface. The original upstream
-README identifies `WindowsLiquidGlass` as MIT licensed; third-party code and binaries retain their
-original ownership and license terms.
+The earlier real-time liquid glass skin adapted the D3D11 rendering core from
+[ai12989757/WindowsLiquidGlass](https://github.com/ai12989757/WindowsLiquidGlass) (MIT licensed).
+That skin and its engine have since been removed, and the third-party code is no longer
+distributed with the project.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.

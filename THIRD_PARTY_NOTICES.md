@@ -3,20 +3,10 @@
 This project includes and adapts third-party components. Their original authorship and license
 terms remain in effect.
 
-## WindowsLiquidGlass
-
-- Upstream repository: <https://github.com/ai12989757/WindowsLiquidGlass>
-- Author / owner: `ai12989757` and contributors
-- Upstream description: Windows desktop Liquid Glass Qt component
-- License: MIT License, as stated by the upstream README
-
-The local `WindowsLiquidGlass/` directory contains the runtime subset used by this project,
-including D3D capture, GPU device management, rounded-rectangle SDF generation, GPU effect
-rendering, compiled shader objects, and native DLLs.
-
-This project uses `WindowsLiquidGlass` to render the Liquid Glass background behind the memo/todo
-widget. The memo application, tray behavior, Fluent settings interface, todo logic, adaptive text
-contrast, and packaging scripts are project-specific additions around that rendering core.
+> Note: earlier versions vendored the `WindowsLiquidGlass` D3D11 "liquid glass" rendering engine
+> (<https://github.com/ai12989757/WindowsLiquidGlass>, MIT). That real-time refraction skin was
+> removed; the widget now renders as a lightweight DWM acrylic / static-image surface, so the
+> engine and its native DLLs / compiled shaders are no longer included.
 
 ## Python Dependencies
 
@@ -24,7 +14,6 @@ Runtime Python dependencies are listed in `LiquidMemoWidget/requirements.txt`. T
 defined by their respective upstream projects, including but not limited to:
 
 - PySide6
-- NumPy
 - PySide6-Fluent-Widgets
 
 ## Notes

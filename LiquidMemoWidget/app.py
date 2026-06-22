@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import ctypes
 import math
 import os
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
-
-import numpy as np
 
 sys.dont_write_bytecode = True
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "0")
@@ -58,49 +54,42 @@ from qfluentwidgets import (
     Theme,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from WindowsLiquidGlass.src.GPUSharderWidget.one_d3d_widget import (  # noqa: E402
-    EFFECTS_PARAMS,
-    EffectType,
-    OneGPUWidget,
-    set_window_exclude_from_capture,
-)
-
-from liquid_effects import build_effect_params, color_overlay_strength
 from skin_editor import load_skin_pixmap, mean_luminance as image_mean_luminance
 from state_store import CalendarEvent, Settings, StateStore, TodoItem, parse_ddl, utc_now
 from wheel_hook import GlobalWheelHook
 from window_layer import (
+    HTBOTTOM,
     HTCAPTION,
     HTCLIENT,
     HTTRANSPARENT,
     WM_ENTERSIZEMOVE,
     WM_EXITSIZEMOVE,
+    WM_NCLBUTTONDBLCLK,
     WM_NCHITTEST,
     apply_tool_window,
     begin_system_move,
     detach_from_parent,
     set_rounded_corners,
     set_topmost,
+    set_window_exclude_from_capture,
 )
 from qframelesswindow.windows.window_effect import WindowsWindowEffect
 from ui_common import (
     FONT_STACK_QSS,
     InfoToolTipFilter,
     POPUP_INPUT_FONT_PX,
+    SETTING_CONTROL_FONT_PX,
+    SETTING_ROW_TITLE_FONT_PX,
     SETTING_STATUS_FONT_PX,
     SETTING_TITLE_FONT_PX,
     add_soft_shadow,
     best_contrast_color,
-    blend_colors,
-    contrast_ratio,
     css_rgba,
+    enlarge_control_font,
     mixed_font,
     qcolor,
     relative_luminance,
+    scaled_dialog_size,
     set_label_font,
     tray_icon,
 )
@@ -108,6 +97,9 @@ from settings_ui import SettingsWindow
 from update_ui import UpdateManager
 from calendar_manager import CalendarManager
 from notify_manager import NotificationManager
+from startup import reconcile_startup
+from floating_launcher import FloatingModeController
+from surprise_mode import SurpriseService, SURPRISE_TEXT
 
 
 MIN_WIDTH = 320
@@ -115,6 +107,12 @@ MAX_WIDTH = 720
 MAX_WIDTH_RATIO = 0.52
 MIN_HEIGHT = 320
 MAX_HEIGHT_RATIO = 0.7
+RESIZE_MARGIN = 6
+SURPRISE_MIN_WIDTH = 400
+# A vertical scrollbar lives inside the list viewport. Reserve its full painted width in the
+# collapsed layout even before Qt decides whether it is needed; otherwise adding the special
+# pinned row can make the bar appear and steal pixels from already-fixed DDL/calendar columns.
+SCROLLBAR_LAYOUT_RESERVE = 12
 ROW_HEIGHT = 44
 OUTER_X = 26
 # DDL column: a fixed-width deadline column shown to the right of each todo's text,
@@ -130,19 +128,18 @@ DDL_COL_PAD = 6
 DDL_SEP_WIDTH = 1
 # Two extra HBox gaps (text↔separator and separator↔ddl) at the layout's 10px spacing.
 DDL_COL_GAPS = 20
-# Deadline highlighting: a parsed DDL already past "now" turns red; one due within
-# DDL_NEAR_WINDOW turns amber. Unparseable or done items follow the normal text color.
+# Deadline highlighting: a parsed DDL already past "now" turns red; one due within the
+# user-configured nearHighlightDays turns amber. Unparseable or done items stay normal.
 DDL_OVERDUE_COLOR = "#FF3B30"
 DDL_NEAR_COLOR = "#FF9500"
-DDL_NEAR_WINDOW = timedelta(hours=24)
 # Placeholder shown in an empty (but visible) DDL cell, signalling it is click-to-set.
 DDL_EMPTY_HINT = "＋"
 # Calendar subscription ("日程" group).
 CALENDAR_HEADER_HEIGHT = 30
 _WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
 # Top/bottom breathing room inside the scrollable list, so the first and last rows are never
-# flush against the scroll viewport edge (which sits near the glass's rounded top/bottom on the
-# glass skin) and get visually clipped. Counted in the window-height budget so it never squeezes.
+# flush against the scroll viewport edge (near the window's rounded top/bottom) and get visually
+# clipped. Counted in the window-height budget so it never squeezes.
 LIST_EDGE_PAD = 7
 
 
@@ -155,15 +152,6 @@ def format_event_time(event: "CalendarEvent") -> str:
     if event.allDay:
         return f"{deadline.strftime('%m-%d')} 周{weekday} 全天"
     return f"{deadline.strftime('%m-%d')} 周{weekday} {deadline.strftime('%H:%M')}"
-BUSY_BACKGROUND_ENTER = 0.36
-BUSY_BACKGROUND_EXIT = 0.26
-HIGH_VISIBILITY_COLORS = ["#39FF14", "#C800FF", "#00F5FF", "#FFF200"]
-_SAMPLE_DIM = 44
-# The glass output is a static transform of the captured background, so the frame loop only
-# exists to follow background changes — it does not need 60fps. Lower rates also leave room
-# for the per-frame blank-frame validation readback.
-REST_FPS = 20
-MOVE_FPS = 30
 
 # Edge auto-hide ("dock"): when the window is dragged within DOCK_THRESHOLD px of a work-area
 # edge (left/right/top) it snaps flush and, once the cursor leaves, slides off-screen leaving a
@@ -174,13 +162,6 @@ DOCK_PEEK = 5
 DOCK_HIDE_DELAY_MS = 600
 DOCK_SLIDE_MS = 200
 DOCK_POLL_MS = 120
-
-
-def _dwm_flush() -> None:
-    try:
-        ctypes.windll.dwmapi.DwmFlush()
-    except Exception:
-        pass
 
 
 def install_tooltip(widget: QWidget) -> None:
@@ -228,16 +209,24 @@ def wrapped_text_height(text: str, width: int) -> int:
 class RoundButton(QPushButton):
     def __init__(self, text: str, size: int = 34, parent: QWidget | None = None, tone: str = "neutral") -> None:
         super().__init__(text, parent)
+        self.tone = tone
         self.setFixedSize(size, size)
         self.setCursor(Qt.PointingHandCursor)
+        self.apply_surprise_theme(False)
+        install_tooltip(self)
+
+    def apply_surprise_theme(self, active: bool) -> None:
         palette = {
             "neutral": ("rgba(255,255,255,88)", "rgba(255,255,255,132)", "rgba(255,255,255,175)", "#111820", "rgba(255,255,255,150)"),
             "add": ("rgba(33,150,243,196)", "rgba(33,150,243,225)", "rgba(18,121,218,235)", "white", "rgba(255,255,255,170)"),
             "hide": ("rgba(255,255,255,105)", "rgba(255,255,255,150)", "rgba(255,255,255,190)", "#30404C", "rgba(255,255,255,150)"),
             "confirm": ("rgba(45,184,130,205)", "rgba(45,184,130,235)", "rgba(24,146,101,242)", "white", "rgba(255,255,255,170)"),
         }
-        bg, hover, pressed, color, border = palette.get(tone, palette["neutral"])
-        radius = size // 2
+        if active:
+            palette["add"] = ("rgba(232,93,147,210)", "rgba(241,119,165,235)", "rgba(201,65,119,242)", "white", "rgba(255,255,255,190)")
+            palette["confirm"] = palette["add"]
+        bg, hover, pressed, color, border = palette.get(self.tone, palette["neutral"])
+        radius = self.width() // 2
         self.setStyleSheet(
             f"""
             QPushButton {{
@@ -253,7 +242,6 @@ class RoundButton(QPushButton):
             QPushButton:pressed {{ background: {pressed}; }}
             """
         )
-        install_tooltip(self)
 
 
 class TodoTextLabel(QLabel):
@@ -322,11 +310,15 @@ class TodoRow(QFrame):
     def __init__(self, todo: TodoItem, settings: Settings, parent_window: "MemoWindow") -> None:
         super().__init__(parent_window.content)
         self.todo = todo
+        self.settings = settings
         self.parent_window = parent_window
+        self._drag_start: QPoint | None = None
+        self._dragging = False
         self._style_signature: tuple[str, bool, bool, str] | None = None
         self._halo: QGraphicsDropShadowEffect | None = None
         self.setMinimumHeight(ROW_HEIGHT)
         self.setObjectName("todoRow")
+        self.setCursor(Qt.OpenHandCursor)
         self.setStyleSheet(
             f"""
             QFrame#todoRow {{
@@ -367,12 +359,15 @@ class TodoRow(QFrame):
         self.text = TodoTextLabel(todo.text)
         self.text.setFont(mixed_font(12))
         self.text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # Let a press on the title reach the row so the whole non-control surface can drag.
+        self.text.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         # Location shows on a dim second line under the title, only when set (📍 …); the column
         # stays single-line otherwise so rows without a location are not taller.
         self.location_label = TodoTextLabel("")
         self.location_label.setFont(mixed_font(10))
         self.location_label.setWordWrap(False)
         self.location_label.setVisible(False)
+        self.location_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(2)
@@ -452,7 +447,7 @@ class TodoRow(QFrame):
         now = datetime.now()
         if deadline < now:
             return "overdue"
-        if deadline - now <= DDL_NEAR_WINDOW:
+        if deadline - now <= timedelta(days=self.settings.nearHighlightDays):
             return "near"
         return "normal"
 
@@ -522,6 +517,42 @@ class TodoRow(QFrame):
 
     def _complete_changed(self) -> None:
         self.parent_window.complete_todo(self.todo.id, self.checkbox.isChecked(), self)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._drag_start = event.position().toPoint()
+            self._dragging = False
+            # Accept the press so this row keeps Qt's implicit mouse grab while the pointer moves
+            # across sibling rows; its move/release handlers can then drive the full drag session.
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_start is None or not (event.buttons() & Qt.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+        distance = (event.position().toPoint() - self._drag_start).manhattanLength()
+        if not self._dragging and distance >= QApplication.startDragDistance():
+            self._dragging = True
+            self.setCursor(Qt.ClosedHandCursor)
+            self.parent_window.begin_todo_reorder(self)
+        if self._dragging:
+            self.parent_window.move_todo_reorder(self, event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        was_dragging = self._dragging
+        self._drag_start = None
+        self._dragging = False
+        self.setCursor(Qt.OpenHandCursor)
+        if event.button() == Qt.LeftButton and was_dragging:
+            self.parent_window.finish_todo_reorder(self)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class CalendarRow(QFrame):
@@ -609,7 +640,8 @@ class CalendarRow(QFrame):
         now = datetime.now()
         if start < now:
             return "overdue"
-        if start - now <= DDL_NEAR_WINDOW:
+        near = timedelta(days=self.parent_window.app.state.settings.nearHighlightDays)
+        if start - now <= near:
             return "near"
         return "normal"
 
@@ -728,6 +760,17 @@ class TodoEditorPopup(QDialog):
         self.ok.clicked.connect(self.accept)
         row.addWidget(self.ok)
         outer.addLayout(row)
+        surprise = getattr(getattr(parent_window, "app", None), "surprise", None)
+        self.apply_surprise_theme(bool(surprise and surprise.active))
+
+    def apply_surprise_theme(self, active: bool) -> None:
+        background = "rgba(255,240,246,242)" if active else "rgba(248,252,255,238)"
+        field = "rgba(255,255,255,185)" if active else "rgba(255,255,255,150)"
+        color = SURPRISE_TEXT if active else "#111820"
+        self.panel.setStyleSheet(
+            f"QFrame#addPanel {{ {FONT_STACK_QSS} border-radius: 22px; border: 1px solid rgba(255,255,255,170); background: {background}; }}"
+            f" QLineEdit {{ {FONT_STACK_QSS} border: 1px solid rgba(255,255,255,145); border-radius: 17px; background: {field}; color: {color}; font-size: {POPUP_INPUT_FONT_PX}px; padding: 9px 14px; selection-background-color: rgba(232,93,147,120); }}"
+        )
 
     def _position(self, point: QPoint, width: int) -> None:
         width = max(420, min(600, width))
@@ -789,7 +832,7 @@ class HistoryWindow(QDialog):
         self.app = app
         self.setWindowTitle("历史记录")
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(620, 620)
+        self.setFixedSize(scaled_dialog_size(620, 620))
         self._build()
 
     def _build(self) -> None:
@@ -809,8 +852,8 @@ class HistoryWindow(QDialog):
         add_soft_shadow(self.frame, blur=34, y=12, alpha=80)
 
         layout = QVBoxLayout(self.frame)
-        layout.setContentsMargins(28, 24, 28, 28)
-        layout.setSpacing(18)
+        layout.setContentsMargins(38, 34, 38, 38)
+        layout.setSpacing(24)
 
         header = QHBoxLayout()
         titles = QVBoxLayout()
@@ -825,9 +868,11 @@ class HistoryWindow(QDialog):
 
         clear = PushButton("清空", self.frame, FluentIcon.DELETE)
         clear.clicked.connect(self._clear)
+        enlarge_control_font(clear)
         header.addWidget(clear)
         close = PrimaryPushButton("完成", self.frame, FluentIcon.ACCEPT)
         close.clicked.connect(self.hide)
+        enlarge_control_font(close)
         header.addWidget(close)
         layout.addLayout(header)
 
@@ -843,6 +888,13 @@ class HistoryWindow(QDialog):
         self.scroll.setWidget(self.content)
         layout.addWidget(self.scroll, 1)
         self.refresh()
+        self.apply_surprise_theme(getattr(getattr(self.app, "surprise", None), "active", False))
+
+    def apply_surprise_theme(self, active: bool) -> None:
+        background = "qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #FFF8FB,stop:1 #FFE3EC)" if active else "rgb(246,248,252)"
+        self.frame.setStyleSheet(
+            f"QFrame#fluentPanel {{ {FONT_STACK_QSS} background: {background}; border: 1px solid rgba(255,255,255,185); border-radius: 22px; }}"
+        )
 
     def refresh(self) -> None:
         while self.list.count():
@@ -856,9 +908,12 @@ class HistoryWindow(QDialog):
             empty_layout.setContentsMargins(22, 22, 22, 22)
             title = BodyLabel("暂无历史事项")
             title.setAlignment(Qt.AlignCenter)
+            set_label_font(title, SETTING_ROW_TITLE_FONT_PX)
             detail = QLabel("勾选完成并归档后的待办会显示在这里。")
             detail.setAlignment(Qt.AlignCenter)
-            detail.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,135);")
+            detail.setStyleSheet(
+                f"{FONT_STACK_QSS} color: rgba(17,24,32,135); font-size: {SETTING_STATUS_FONT_PX}px;"
+            )
             empty_layout.addWidget(title)
             empty_layout.addWidget(detail)
             self.list.addWidget(empty)
@@ -868,21 +923,25 @@ class HistoryWindow(QDialog):
         for todo in reversed(self.app.state.history[-30:]):
             card = CardWidget()
             row_layout = QHBoxLayout(card)
-            row_layout.setContentsMargins(18, 12, 14, 12)
-            row_layout.setSpacing(14)
+            row_layout.setContentsMargins(24, 18, 20, 18)
+            row_layout.setSpacing(18)
 
             text_layout = QVBoxLayout()
             text_layout.setSpacing(4)
             label = BodyLabel(todo.text)
             label.setWordWrap(True)
+            set_label_font(label, SETTING_CONTROL_FONT_PX)
             meta = QLabel("已完成" if not todo.completedAt else f"完成于 {todo.completedAt[:10]}")
-            meta.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,130); font-size: 12px;")
+            meta.setStyleSheet(
+                f"{FONT_STACK_QSS} color: rgba(17,24,32,130); font-size: {SETTING_STATUS_FONT_PX}px;"
+            )
             text_layout.addWidget(label)
             text_layout.addWidget(meta)
             row_layout.addLayout(text_layout, 1)
 
             restore = PushButton("恢复", card, FluentIcon.RETURN)
             restore.clicked.connect(lambda _=False, todo_id=todo.id: self._restore(todo_id))
+            enlarge_control_font(restore)
             row_layout.addWidget(restore)
             self.list.addWidget(card)
         self.list.addStretch()
@@ -904,42 +963,14 @@ class HistoryWindow(QDialog):
 MEMO_TOP_BLOCK = 68
 
 
-class GlassSkin:
-    """Liquid-glass skin: defines the background geometry and the content insets that keep rows
-    inside the visible glass. The glass rounded-rect is the window scaled by `geometry_scale`, so
-    it leaves a margin proportional to the window size on every side; content must inset by that
-    same proportional padding or it spills into the transparent gap (most visible at the bottom
-    once the window grows tall, e.g. in expanded mode).
-
-    Future skins (e.g. a flat translucent panel for low-end PCs) can set geometry_scale = 1.0
-    (no padding, content fills the window) and uses_glass = False; the inset math below degrades
-    to the static corner margin with no special-casing."""
-
-    kind = "glass"
-    geometry_scale = 0.94
-    radius_ratio = 0.24
-    corner_margin = 8  # rounded-corner avoidance + a little breathing room
-    uses_glass = True
-
-    def vertical_padding(self, height: int) -> int:
-        return round(height * (1.0 - self.geometry_scale) / 2.0)
-
-    def horizontal_padding(self, width: int) -> int:
-        return round(width * (1.0 - self.geometry_scale) / 2.0)
-
-
 class AcrylicSkin:
-    """Lightweight frosted-glass skin for low-end PCs. The window is a translucent DWM
-    acrylic surface (rounded by DWM, not an SDF) with no GPU screen capture, no effect chain,
-    and no contrast sampling — so the whole window IS the surface (geometry_scale = 1.0) and
-    content fills it with only a small corner margin. uses_glass = False makes the inset math
-    in _resize_for_content collapse to the static corner margin."""
+    """Frosted-glass skin: the window is a translucent DWM acrylic surface (rounded by DWM) with
+    no GPU screen capture and no effect chain — so the whole window IS the surface
+    (geometry_scale = 1.0) and content fills it with only a small corner margin."""
 
     kind = "acrylic"
     geometry_scale = 1.0
-    radius_ratio = 0.0
     corner_margin = 14
-    uses_glass = False
 
     def vertical_padding(self, height: int) -> int:
         return 0
@@ -966,9 +997,7 @@ class ImageSkin:
 
     kind = "image"
     geometry_scale = 1.0
-    radius_ratio = 0.0
     corner_margin = 14
-    uses_glass = False
 
     def __init__(self, image_path: "Path | None" = None) -> None:
         self.image_path = image_path
@@ -1007,13 +1036,13 @@ class _ImageBackground(QWidget):
         painter.drawPixmap(rect, scaled, QRect(x, y, rect.width(), rect.height()))
 
 
-class MemoWindow(OneGPUWidget):
+class MemoWindow(QWidget):
     def __init__(self, app: "LiquidMemoApp") -> None:
-        super().__init__(qt_move=False)
+        super().__init__()
         self.app = app
         self.skin = self._make_skin(app.state.settings.skin)
         # Tracks which rendering mode is currently live so apply_settings only performs the
-        # (heavier) glass<->acrylic transition when the skin actually changes.
+        # acrylic<->image transition when the skin actually changes.
         self._active_skin_kind: str | None = None
         self._window_effect = WindowsWindowEffect(self)
         self._acrylic_applied = False
@@ -1026,38 +1055,26 @@ class MemoWindow(OneGPUWidget):
         self.setWindowTitle("桌面备忘")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent;")
         self.setMouseTracking(True)
+        # All interactive content lives in this transparent child layer, kept out of any screen
+        # capture by protect_content_layer(); the window itself only carries the frost / image
+        # surface. (Previously provided by the D3D base class; recreated here directly.)
+        self.container = QWidget(self)
+        self.container.setStyleSheet("background: transparent;")
+        self.container.setAttribute(Qt.WA_TranslucentBackground)
+        self.container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._rows: dict[str, TodoRow] = {}
         self._event_rows: dict[str, CalendarRow] = {}
         self._calendar_header: QLabel | None = None
+        self._surprise_row: QWidget | None = None
         # Expanded mode grows the window to fit all content (no height clamp, no scrollbar, no
         # elided text); collapsed mode keeps the default clamp + scroll behavior.
         self._expanded = False
         self._shown_once = False
-        self._sampled_background = QColor(246, 248, 252)
-        self._background_complexity = 0.0
-        self._background_extremely_busy = False
-        self._auto_text_color = qcolor(app.state.settings.todoTextColor)
-        self._last_text_color_change = 0.0
-        self._latest_frame: np.ndarray | None = None
-        self._effects_enabled = False
         self._window_layer_applied = False
         self._is_window_moving = False
-        self._contrast_was_active = False
-        self._capture_source_ready = False
-        self._last_capture_reset = time.monotonic()
-        self._last_capture_sync = 0.0
-        self._effect_signature: tuple[str, int, int] | None = None
-        self._contrast_timer = QTimer(self)
-        self._contrast_timer.setTimerType(Qt.PreciseTimer)
-        self._contrast_timer.setInterval(300)
-        self._contrast_timer.timeout.connect(self.update_auto_contrast)
-        # Coalesces the "force a contrast refresh after a change settled" requests so a
-        # rapid stream of apply_settings() calls (e.g. dragging a slider) collapses into a
-        # single forced sample instead of queuing dozens of full captures.
-        self._contrast_refresh_timer = QTimer(self)
-        self._contrast_refresh_timer.setSingleShot(True)
-        self._contrast_refresh_timer.timeout.connect(lambda: self.update_auto_contrast(force=True))
+        self._reorder_row: TodoRow | None = None
         self._build_content()
         # Global wheel hook: scroll the list whenever the cursor is over it, bypassing the
         # click-through hit-testing that otherwise sends wheel events to the desktop below.
@@ -1078,17 +1095,6 @@ class MemoWindow(OneGPUWidget):
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._hide_docked)
-
-    def _is_static_skin(self) -> bool:
-        """True for the non-capture skins (acrylic frost or static image), where text color is
-        deterministic and there is no live desktop sampling to drive auto-contrast."""
-        skin = self.app.state.settings.skin
-        return skin == "acrylic" or skin.startswith("image:")
-
-    def schedule_contrast_refresh(self, delay: int = 180) -> None:
-        if self._is_static_skin() or self.app.state.settings.fontColorMode == "manual":
-            return
-        self._contrast_refresh_timer.start(delay)
 
     @property
     def content(self) -> QWidget:
@@ -1115,7 +1121,7 @@ class MemoWindow(OneGPUWidget):
         top.addWidget(self.add_button)
         self.hide_button = RoundButton("–", tone="hide")
         self.hide_button.setToolTip("最小化")
-        self.hide_button.clicked.connect(self.hide)
+        self.hide_button.clicked.connect(self.app.hide_memo_window)
         top.addWidget(self.hide_button)
         self.layout.addLayout(top)
 
@@ -1146,139 +1152,14 @@ class MemoWindow(OneGPUWidget):
         self.add_popup = TodoEditorPopup(self)
 
     def protect_content_layer(self) -> None:
+        # Keep the content layer above the surface and excluded from any screen capture (so
+        # screenshots / recordings of the desktop don't grab the widget's own text).
         if self.container:
             self.container.raise_()
-        set_window_exclude_from_capture(self, exclude=True)
-
-    def sync_capture_position(self, render: bool = False) -> None:
-        try:
-            self._update_pending_pos()
-            self._last_capture_sync = time.monotonic()
-            if render:
-                self._on_frame()
-        except Exception as exc:
-            print(f"[LiquidMemo] capture sync failed: {exc}")
-
-    def reset_capture_pipeline(self, reason: str = "manual") -> None:
-        try:
-            was_active = self._timer.isActive()
-            fps = self._fps or REST_FPS
-            self.stop()
-            if self._resource_id:
-                self._mgr.remove_resource(self._resource_id)
-        except Exception:
-            was_active = True
-            fps = REST_FPS
-
-        self._resource_id = 0
-        self._last_display_id = 0
-        self._capture_source_ready = False
-
-        try:
-            self._mgr.shutdown_display_capture()
-            if not self._mgr.initialize_display_capture():
-                print(f"[LiquidMemo] display capture reset failed: {reason}")
-                return
-            self.set_capture_source(display_index=self._display_index, tag="LiquidMemoWidget")
-            self._capture_source_ready = True
-            self.sync_capture_position(render=True)
-            for delay in (40, 120, 260):
-                QTimer.singleShot(delay, lambda: self.sync_capture_position(render=True))
-        except Exception as exc:
-            print(f"[LiquidMemo] display capture reset error: {exc}")
-        finally:
-            self._last_capture_reset = time.monotonic()
-            if was_active or self.isVisible():
-                self.start(fps=fps)
-
-    def refresh_capture_after_idle(self) -> None:
-        if time.monotonic() - self._last_capture_reset > 45:
-            self.reset_capture_pipeline("idle-before-move")
-        else:
-            self.sync_capture_position(render=True)
-
-    def ensure_frame_loop(self, fps: int = REST_FPS) -> None:
-        if not self._timer.isActive() or self._fps != fps:
-            self.start(fps=fps)
-
-    def _on_frame(self) -> None:
-        # Validated replacement for OneGPUWidget._on_frame. The OS desktop duplication
-        # occasionally hands back an all-black frame for this WDA_EXCLUDEFROMCAPTURE
-        # window's region; the stock loop presented those directly, which is the visible
-        # black<->transparent flicker. Here every captured frame is read back and checked
-        # first — a blank frame is dropped and the last good output stays on screen.
-        if self._active_skin_kind in ("acrylic", "image"):
-            return  # static skins do no screen capture; the frost / image follows the window
-        d3d = self._d3d
-        if not d3d._presenter_id or d3d._capture_w <= 0 or d3d._capture_h <= 0:
-            return
-
-        new_id = self._mgr.capture_display_region(
-            display_index=self._display_index,
-            x=self._pending_x,
-            y=self._pending_y,
-            width=d3d._capture_w,
-            height=d3d._capture_h,
-            tag=self._capture_tag,
-        )
-        self._frame_count += 1
-        if not new_id:
-            self._present_last_frame()
-            return
-
-        frame: np.ndarray | None
-        try:
-            frame = self._mgr.copy_resource_to_numpy(new_id)
-        except Exception:
-            frame = None
-        if frame is not None and self._last_display_id and self._frame_looks_blank(frame):
-            if new_id != self._resource_id:
-                self._mgr.remove_resource(new_id)
-            self._present_last_frame()
-            return
-        if frame is not None:
-            self._latest_frame = frame
-
-        if self._resource_id and self._resource_id != new_id:
-            self._mgr.remove_resource(self._resource_id)
-        self._resource_id = new_id
-
-        display_id = new_id
-        if self._fx_ready and self._has_effects and self._sdf_id:
-            output_id = self._fx.render_effects_by_id(
-                screen_resource_id=new_id,
-                sdf_resource_id=self._sdf_id,
-            )
-            if output_id:
-                display_id = output_id
-            else:
-                self._present_last_frame()
-                return
-
-        _dwm_flush()
-        d3d._present(display_id)
-        self._last_display_id = display_id
-
-    def _present_last_frame(self) -> None:
-        if self._last_display_id:
-            _dwm_flush()
-            self._d3d._present(self._last_display_id)
-
-    @staticmethod
-    def _frame_looks_blank(frame: np.ndarray) -> bool:
-        # Genuine desktops are never pitch black across the whole region (even dark
-        # wallpapers carry a few brighter pixels); a duplication glitch frame is exactly 0.
-        return int(frame[::8, ::8, :3].max()) < 6
+        set_window_exclude_from_capture(int(self.winId()), exclude=True)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        # In the static skins (frost / image) the D3D surface is never presented; hide it before
-        # the first paint so its blank swapchain doesn't flash over the background before
-        # apply_settings runs.
-        if self._is_static_skin() and not self._d3d.isHidden():
-            self._d3d.hide()
-        # Keep our own text/control layer out of the GPU screen capture. Otherwise
-        # the next liquid-glass frame captures and refracts the text itself.
         self.protect_content_layer()
         for delay in (0, 80, 180, 420):
             QTimer.singleShot(delay, self.protect_content_layer)
@@ -1304,29 +1185,49 @@ class MemoWindow(OneGPUWidget):
         self._dock_animating = False
         super().hideEvent(event)
 
+    def cleanup(self) -> None:
+        # Called on app shutdown. No GPU/capture resources to release anymore (the D3D engine is
+        # gone); just stop the dock timers and any in-flight slide.
+        self._dock_poll.stop()
+        self._hide_timer.stop()
+        self._cancel_slide()
+
     def moveEvent(self, event) -> None:
         super().moveEvent(event)
         if self._shown_once:
             # During a dock slide the window is mid-animation toward an off-screen position; skip
-            # the per-move capture/save/contrast work (and don't persist off-screen coordinates).
+            # the per-move save work (and don't persist off-screen coordinates).
             if self._dock_animating:
+                return
+            # In floating-launcher mode the panel is an ephemeral popover anchored to the
+            # launcher. Do not overwrite the user's normal/edge-mode window position.
+            if self.app.state.settings.windowMode == "floatingLauncher":
                 return
             self.app.state.window.x = self.x()
             self.app.state.window.y = self.y()
             if self._is_window_moving:
-                self.sync_capture_position(render=True)
                 return
-            self.sync_capture_position(render=False)
             QTimer.singleShot(0, self.protect_content_layer)
             self.app.save_later()
-            self.schedule_contrast_refresh(80)
 
     def resizeEvent(self, event) -> None:
-        # The base resizeEvent syncs the D3D child + capture rect; the image layer (a sibling
-        # child) must track the window the same way so the static background always fills it.
+        # The container fills the window; the image layer (a sibling child) tracks it too so the
+        # static background always covers the window.
         super().resizeEvent(event)
+        if self.container is not None:
+            self.container.setGeometry(0, 0, self.width(), self.height())
         if self._image_bg is not None:
             self._image_bg.setGeometry(0, 0, self.width(), self.height())
+        if (
+            self._is_window_moving
+            and not self._expanded
+            and event.oldSize().height() != event.size().height()
+        ):
+            # Programmatic content-fit resizes happen outside the native size/move loop, so only
+            # a real bottom-edge drag reaches this branch and becomes the user's saved height.
+            self.app.state.window.manualHeight = self.height()
+            self.app.state.window.height = self.height()
+            self.app.save_later()
 
     def nativeEvent(self, event_type, message):
         if event_type == b"windows_generic_MSG":
@@ -1342,12 +1243,25 @@ class MemoWindow(OneGPUWidget):
                 # the window receives WM_MOUSEMOVE over it and can slide back out.
                 if self._dock_hidden and not self._dock_animating and self._peek_rect_local().contains(local):
                     return True, HTCLIENT
-                if self._rect_for(self.drag_handle).contains(local):
+                if (
+                    not self._expanded
+                    and 0 <= local.x() < self.width()
+                    and self.height() - RESIZE_MARGIN <= local.y() <= self.height()
+                ):
+                    return True, HTBOTTOM
+                if self.drag_handle.isVisible() and self._rect_for(self.drag_handle).contains(local):
                     return True, HTCAPTION
+                if self._point_over_todo_row(local):
+                    return True, HTCLIENT
                 if self._is_interactive_point(local):
                     return True, HTCLIENT
                 if self.app.state.settings.layerMode == "alwaysVisibleClickThrough":
                     return True, HTTRANSPARENT
+            if msg.message == WM_NCLBUTTONDBLCLK and int(msg.wParam) == HTBOTTOM:
+                self.app.state.window.manualHeight = None
+                self.app.save_later()
+                self.refresh()
+                return True, 0
             if msg.message == WM_MOUSEMOVE:
                 # Only the peek strip is HTCLIENT while hidden, so any mouse-move here means the
                 # cursor reached the strip — slide the window back out.
@@ -1371,10 +1285,16 @@ class MemoWindow(OneGPUWidget):
             widgets.extend([row.checkbox, row.urgent, row.ddl_label, row.edit_btn])
         for row in self._event_rows.values():
             widgets.append(row.checkbox)
+        if self._surprise_row is not None:
+            widgets.extend([self._surprise_row.checkbox, self._surprise_row.draw])
         # Wheel scrolling over the list is handled by the global wheel hook (see
-        # _on_global_wheel), so the list area can stay click-through: only the discrete controls
-        # below are interactive, everything else passes clicks to the desktop.
+        # _on_global_wheel). Todo rows are handled separately by _point_over_todo_row; outside
+        # those rows, only these discrete controls receive clicks.
         return any(widget.isVisible() and self._rect_for(widget).adjusted(-4, -4, 4, 4).contains(point) for widget in widgets)
+
+    def _point_over_todo_row(self, point: QPoint) -> bool:
+        """Todo rows receive Qt mouse events for reordering; calendar rows stay click-through."""
+        return any(row.isVisible() and self._rect_for(row).contains(point) for row in self._rows.values())
 
     def begin_system_move(self) -> None:
         self._begin_window_move()
@@ -1385,12 +1305,7 @@ class MemoWindow(OneGPUWidget):
         if self._is_window_moving:
             return
         self._is_window_moving = True
-        if self._active_skin_kind in ("acrylic", "image"):
-            return  # frost / image follow the window — no capture loop to spin up
-        self._contrast_was_active = self._contrast_timer.isActive()
-        self._contrast_timer.stop()
-        self.refresh_capture_after_idle()
-        self.start(fps=MOVE_FPS)
+        # The frost / image surface follows the window natively — nothing to spin up on move.
 
     def _end_window_move(self) -> None:
         if not self._is_window_moving:
@@ -1399,16 +1314,7 @@ class MemoWindow(OneGPUWidget):
         self.app.state.window.x = self.x()
         self.app.state.window.y = self.y()
         self.app.save_later()
-        if self._active_skin_kind in ("acrylic", "image"):
-            self.protect_content_layer()
-            self._maybe_dock()
-            return
-        self.sync_capture_position(render=True)
         self.protect_content_layer()
-        self.start(fps=REST_FPS)
-        if self.app.state.settings.fontColorMode != "manual":
-            self._contrast_timer.start()
-            self.schedule_contrast_refresh()
         self._maybe_dock()
 
     # ── Edge auto-hide (dock) ────────────────────────────────────────────────────────────
@@ -1444,7 +1350,7 @@ class MemoWindow(OneGPUWidget):
 
     def _maybe_dock(self) -> None:
         # Called after a move ends: dock to the nearest edge within threshold, else undock.
-        if not self.app.state.settings.edgeAutoHide or not self.isVisible():
+        if self.app.state.settings.windowMode != "edgeHide" or not self.isVisible():
             self._undock()
             return
         g = self._dock_geometry()
@@ -1486,8 +1392,6 @@ class MemoWindow(OneGPUWidget):
         self._dock_poll.stop()
         self._hide_timer.stop()
         self._cancel_slide()
-        if self._active_skin_kind == "glass":
-            self.ensure_frame_loop(REST_FPS)
 
     def _reposition_dock(self) -> None:
         target = self._dock_pos(self._dock_hidden)
@@ -1508,9 +1412,6 @@ class MemoWindow(OneGPUWidget):
         self.move(self._dock_pos(hidden=False))
         self._dock_animating = False
         self._dock_hidden = False
-        if self._active_skin_kind == "glass":
-            self.ensure_frame_loop(REST_FPS)
-            self.sync_capture_position(render=True)
         self.protect_content_layer()
         if self._dock_edge is not None:
             self._dock_poll.start(DOCK_POLL_MS)
@@ -1531,8 +1432,6 @@ class MemoWindow(OneGPUWidget):
         if self._dock_edge is None or not self._dock_hidden or self._dock_animating:
             return
         self._dock_hidden = False
-        if self._active_skin_kind == "glass":
-            self.ensure_frame_loop(REST_FPS)
         self._animate_to(self._dock_pos(hidden=False))
         self._dock_poll.start(DOCK_POLL_MS)
 
@@ -1562,13 +1461,6 @@ class MemoWindow(OneGPUWidget):
     def _on_slide_finished(self) -> None:
         self._dock_animating = False
         self._slide_anim = None
-        if self._active_skin_kind == "glass":
-            if self._dock_hidden:
-                self.stop()  # fully off-screen: stop the capture loop (saves power)
-            else:
-                self.refresh_capture_after_idle()
-                self.ensure_frame_loop(REST_FPS)
-                self.sync_capture_position(render=True)
         self.protect_content_layer()
 
     def _peek_rect_global(self) -> QRect:
@@ -1605,6 +1497,7 @@ class MemoWindow(OneGPUWidget):
     def _suppress_hide(self) -> bool:
         return (
             self._is_window_moving
+            or self._reorder_row is not None
             or self.add_popup.isVisible()
             or self.app.settings_window.isVisible()
             or self.app.history_window.isVisible()
@@ -1625,7 +1518,7 @@ class MemoWindow(OneGPUWidget):
         self.move(x, y)
 
     def _make_skin(self, skin_name: str):
-        if skin_name == "acrylic":
+        if getattr(self.app, "surprise", None) is not None and self.app.surprise.active:
             return AcrylicSkin()
         if skin_name.startswith("image:"):
             skin_id = skin_name[len("image:"):]
@@ -1633,88 +1526,34 @@ class MemoWindow(OneGPUWidget):
             if custom is not None and custom.image_path().exists():
                 return ImageSkin(custom.image_path())
             return AcrylicSkin()  # missing/deleted image -> safe fallback to the frost skin
-        return GlassSkin()
+        return AcrylicSkin()
 
-    def apply_settings(self, refresh_rows: bool = False, reset_capture: bool = False) -> None:
+    def apply_settings(self, refresh_rows: bool = False) -> None:
         settings = self.app.state.settings
-        # _make_skin already resolves a missing image skin down to AcrylicSkin, so branch on the
-        # resolved skin's kind (not the raw "image:<id>" string) for both dispatch and change
-        # detection — otherwise "image" never equals "image:<id>" and skin_changed misfires.
+        # _make_skin resolves a missing image skin down to AcrylicSkin, so branch on the resolved
+        # skin's kind (not the raw "image:<id>" string) for both dispatch and change detection —
+        # otherwise "image" never equals "image:<id>" and skin_changed misfires.
         self.skin = self._make_skin(settings.skin)
         new_kind = self.skin.kind
         skin_changed = self._active_skin_kind not in (None, new_kind)
-        if new_kind == "acrylic":
-            self._apply_acrylic_mode()
-        elif new_kind == "image":
+        if new_kind == "image":
             self._apply_image_mode()
         else:
-            self._apply_glass_mode(reset_capture)
-        # The two skins use different content insets/geometry (glass padding vs acrylic
-        # full-fill), so a skin switch needs a relayout even if the caller didn't ask for one.
+            self._apply_acrylic_mode()
+        # Frost and image use the same full-fill geometry, but switching between them swaps the
+        # background layer, so a skin change still needs a relayout even if not explicitly asked.
         if refresh_rows or skin_changed:
             self.refresh()
         self.protect_content_layer()
         self.apply_window_layer()
-        if not settings.edgeAutoHide:
+        if settings.windowMode != "edgeHide":
             self._undock()
 
-    def _apply_glass_mode(self, reset_capture: bool = False) -> None:
-        settings = self.app.state.settings
-        if self._active_skin_kind not in (None, "glass"):
-            # Coming back from acrylic/image: drop the frost or hide the image layer, re-show the
-            # D3D surface, and rebuild the capture pipeline (stopped / stale while static).
-            self._remove_acrylic()
-            self._hide_image_bg()
-            # Glass rounds itself via the SDF, not DWM; clear the DWM corner rounding the image
-            # skin turned on (acrylic exit clears it too, but only when acrylic was applied).
-            set_rounded_corners(int(self.winId()), False)
-            self._d3d.show()
-            reset_capture = True
-        self._active_skin_kind = "glass"
-
-        if reset_capture:
-            self.reset_capture_pipeline("settings")
-        elif not self._capture_source_ready:
-            self.set_capture_source(display_index=0, tag="LiquidMemoWidget")
-            self._capture_source_ready = True
-            self._last_capture_reset = time.monotonic()
-            self.sync_capture_position(render=True)
-        else:
-            self.sync_capture_position(render=False)
-
-        # Re-enabling the effect chain resets renderer state and can drop/blank a frame, so
-        # do it once: apply_settings runs on every slider tick while dragging.
-        if not self._effects_enabled:
-            self.enable_effects([
-                EffectType.FLOW,
-                EffectType.CHROMATIC_ABERRATION,
-                EffectType.HIGHLIGHT,
-                EffectType.ANTI_ALIASING,
-                EffectType.COLOR_OVERLAY,
-            ])
-            self._effects_enabled = True
-        effect_signature = (settings.windowTint, int(settings.glassOpacity * 1000), int(settings.liquidStrength * 1000))
-        if effect_signature != self._effect_signature:
-            self.update_effects(build_effect_params(EFFECTS_PARAMS, settings.windowTint, settings.glassOpacity, settings.liquidStrength))
-            self._effect_signature = effect_signature
-        self.ensure_frame_loop(fps=REST_FPS)
-        if settings.fontColorMode == "manual":
-            self._contrast_timer.stop()
-            self.apply_text_colors()
-        else:
-            if not self._contrast_timer.isActive():
-                self._contrast_timer.start()
-            self.schedule_contrast_refresh()
-
     def _apply_acrylic_mode(self) -> None:
-        # Frosted mode: no screen capture, no effect chain, no contrast sampling. The window is
-        # a translucent DWM acrylic surface; the D3D child is hidden so the frost shows through.
+        # Frosted mode: the window is a translucent DWM acrylic surface; the image layer (if any)
+        # is hidden so the frost shows through.
         self._active_skin_kind = "acrylic"
-        self._contrast_timer.stop()
-        self.stop()
         self._hide_image_bg()
-        if not self._d3d.isHidden():
-            self._d3d.hide()
         self._apply_acrylic_effect()
         self.apply_text_colors()
 
@@ -1729,15 +1568,10 @@ class MemoWindow(OneGPUWidget):
             self._image_bg.hide()
 
     def _apply_image_mode(self) -> None:
-        # Static image surface: like acrylic there is no screen capture, effect chain or contrast
-        # sampling. The D3D child is hidden; _image_bg paints the cover-scaled image below the
+        # Static image surface: _image_bg paints the cover-scaled image below the
         # (capture-excluded) content layer, and DWM rounds the window corners.
         self._active_skin_kind = "image"
-        self._contrast_timer.stop()
-        self.stop()
         self._remove_acrylic()
-        if not self._d3d.isHidden():
-            self._d3d.hide()
         path = getattr(self.skin, "image_path", None)
         pixmap = load_skin_pixmap(path) if path is not None else None
         self._image_pixmap = pixmap
@@ -1754,7 +1588,7 @@ class MemoWindow(OneGPUWidget):
 
     def _apply_acrylic_effect(self) -> None:
         settings = self.app.state.settings
-        tint = qcolor(settings.windowTint, "#F2F4F7")
+        tint = qcolor("#FFDDE8" if self.app.surprise.active else settings.windowTint, "#F2F4F7")
         gradient = f"{tint.red():02X}{tint.green():02X}{tint.blue():02X}{ACRYLIC_TINT_ALPHA:02X}"
         if self._acrylic_applied and gradient == self._acrylic_signature:
             return  # avoid re-issuing the composition attribute on every slider tick (flicker)
@@ -1789,12 +1623,49 @@ class MemoWindow(OneGPUWidget):
 
     @staticmethod
     def _todo_sort_key(item: TodoItem) -> tuple:
-        # Urgent items stay pinned to the top (existing behavior). Within each group, items
-        # with a parseable deadline sort by it (earliest first); items without a usable date
-        # fall back to their manual order, landing after the dated ones.
-        deadline = parse_ddl(item.ddl)
-        ddl_rank = deadline.timestamp() if deadline else float("inf")
-        return (not item.urgent, ddl_rank, item.order, item.createdAt)
+        # Urgent items stay pinned; within each group the user's drag order is authoritative.
+        return (not item.urgent, item.order, item.createdAt)
+
+    def _todo_rows_in_layout(self) -> list[TodoRow]:
+        rows: list[TodoRow] = []
+        for index in range(self.list_layout.count()):
+            widget = self.list_layout.itemAt(index).widget()
+            if isinstance(widget, TodoRow):
+                rows.append(widget)
+        return rows
+
+    def begin_todo_reorder(self, row: TodoRow) -> None:
+        if row not in self._todo_rows_in_layout():
+            return
+        self._reorder_row = row
+        row.raise_()
+
+    def move_todo_reorder(self, row: TodoRow, global_pos: QPoint) -> None:
+        if self._reorder_row is not row:
+            return
+        rows = self._todo_rows_in_layout()
+        if row not in rows:
+            return
+        cursor_y = self.list_widget.mapFromGlobal(global_pos).y()
+        others = [candidate for candidate in rows if candidate is not row]
+        target_index = sum(cursor_y >= candidate.geometry().center().y() for candidate in others)
+        if target_index == rows.index(row):
+            return
+        self.list_layout.removeWidget(row)
+        self.list_layout.insertWidget(target_index, row)
+        self.list_layout.activate()
+        row.raise_()
+
+    def finish_todo_reorder(self, row: TodoRow) -> None:
+        if self._reorder_row is not row:
+            return
+        self._reorder_row = None
+        # Assign one monotonic sequence to the visual list. refresh() immediately re-pins urgent
+        # rows while preserving the resulting manual order inside each urgent/non-urgent group.
+        for order, ordered_row in enumerate(self._todo_rows_in_layout()):
+            ordered_row.todo.order = order
+        self.app.save()
+        self.refresh()
 
     def refresh(self) -> None:
         while self.list_layout.count():
@@ -1804,11 +1675,16 @@ class MemoWindow(OneGPUWidget):
         self._rows.clear()
         self._event_rows.clear()
         self._calendar_header = None
+        self._surprise_row = self.app.surprise.make_row(self.content)
 
         active = sorted(self.app.state.todos, key=self._todo_sort_key)
         events = self._visible_calendar_events()
-        self.scroll.setVisible(bool(active) or bool(events))
-        self.empty.setVisible(not active and not events)
+        has_surprise = self._surprise_row is not None
+        self.scroll.setVisible(bool(active) or bool(events) or has_surprise)
+        self.empty.setVisible(not active and not events and not has_surprise)
+
+        if self._surprise_row is not None:
+            self.list_layout.addWidget(self._surprise_row)
 
         for todo in active:
             row = TodoRow(todo, self.app.state.settings, self)
@@ -1827,6 +1703,9 @@ class MemoWindow(OneGPUWidget):
         self.list_layout.addStretch()
         self._resize_for_content(active, events)
         self.apply_text_colors()
+        controller = getattr(self.app, "floating", None)
+        if controller is not None:
+            controller.update_status()
 
     def _visible_calendar_events(self) -> list[CalendarEvent]:
         # Synced events are read-only and never archive to history (they would just re-sync),
@@ -1890,13 +1769,14 @@ class MemoWindow(OneGPUWidget):
 
     def _normal_text_color(self) -> QColor:
         settings = self.app.state.settings
-        if settings.skin == "acrylic":
-            return self._acrylic_text_color()  # frost ignores manual mode (deterministic by tint)
-        if settings.fontColorMode == "manual":
-            return qcolor(settings.todoTextColor)
+        if self.app.surprise.active:
+            return qcolor(SURPRISE_TEXT)
         if settings.skin.startswith("image:"):
+            # Image surfaces honor a manual color choice; otherwise pick by image luminance.
+            if settings.fontColorMode == "manual":
+                return qcolor(settings.todoTextColor)
             return self._image_text_color()
-        return QColor(self._auto_text_color)
+        return self._acrylic_text_color()  # frost: deterministic by tint luminance
 
     def text_color_for(self, todo: TodoItem) -> QColor:
         if todo.urgent:
@@ -1904,12 +1784,9 @@ class MemoWindow(OneGPUWidget):
         return self._normal_text_color()
 
     def text_needs_halo(self) -> bool:
-        settings = self.app.state.settings
-        if self._is_static_skin():
-            return False  # frost / static image are even surfaces with deterministic text — no halo
-        if settings.fontColorMode == "manual":
-            return False
-        return settings.fontColorMode == "autoEnhanced" or self._background_extremely_busy
+        # Both remaining skins are even, static surfaces with deterministic text — never any halo.
+        # (Kept as a method because TodoRow/CalendarRow constructors call it.)
+        return False
 
     def apply_text_colors(self) -> None:
         for row in self._rows.values():
@@ -1921,125 +1798,9 @@ class MemoWindow(OneGPUWidget):
             self._calendar_header.setStyleSheet(
                 f"{FONT_STACK_QSS} color: {css_rgba(normal, 0.7)}; font-size: 11pt; font-weight: 600; padding-left: 6px;"
             )
-        # `normal` already resolves to the manual/auto/acrylic color, so it is the right base
+        # `normal` already resolves to the manual/acrylic/image color, so it is the right base
         # for the empty-state label in every skin and font mode.
         self.empty.setStyleSheet(f"{FONT_STACK_QSS} color: {css_rgba(normal, 0.58)}; font-size: 15px;")
-
-    def update_auto_contrast(self, force: bool = False) -> None:
-        if not self.isVisible() or self._is_static_skin():
-            return
-        if self.app.state.settings.fontColorMode == "manual":
-            return
-        sample = self._sample_background()
-        if sample is None:
-            sampled_background = QColor(self._sampled_background)
-            complexity = self._background_complexity
-        else:
-            sampled_background, complexity = sample
-
-        background = self._effective_contrast_background(sampled_background)
-        busy = complexity >= (BUSY_BACKGROUND_EXIT if self._background_extremely_busy else BUSY_BACKGROUND_ENTER)
-        if busy:
-            next_text = best_contrast_color(background, HIGH_VISIBILITY_COLORS)
-        else:
-            next_text = best_contrast_color(background, ["#05080C", "#111820", "#F7FAFF", "#FFFFFF"])
-
-        current_text_gain = contrast_ratio(self._auto_text_color, background)
-        next_text_gain = contrast_ratio(next_text, background)
-
-        now = time.monotonic()
-        changed = False
-        if busy != self._background_extremely_busy:
-            self._background_extremely_busy = busy
-            changed = True
-        # Switch color only when the current one is genuinely hard to read, or the candidate
-        # is clearly better AND the last switch has settled. Rapid back-and-forth color swaps
-        # every sample read as text flicker, so prefer keeping a readable color stable.
-        settled = (now - self._last_text_color_change) >= 1.0
-        should_switch = force or current_text_gain < 3.2 or (settled and next_text_gain > current_text_gain + 0.75)
-        if next_text.name() != self._auto_text_color.name() and should_switch:
-            self._auto_text_color = next_text
-            self._last_text_color_change = now
-            changed = True
-        self._background_complexity = complexity
-        self._sampled_background = sampled_background
-
-        if changed:
-            self.apply_text_colors()
-
-    def _effective_contrast_background(self, sampled_background: QColor) -> QColor:
-        settings = self.app.state.settings
-        tint = qcolor(settings.windowTint, "#FFFFFF")
-        return blend_colors(sampled_background, tint, color_overlay_strength(settings.glassOpacity))
-
-    def _sample_background(self) -> tuple[QColor, float] | None:
-        # Reuse the frame the validated render loop (_on_frame) already read back and
-        # blank-checked: the desktop content directly behind this window with the window
-        # itself omitted. The contrast sampler therefore issues no screen capture and no
-        # GPU readback of its own.
-        frame = self._latest_frame
-        if frame is None:
-            return None
-        return self._analyze_sample_array(frame)
-
-    def _analyze_sample_array(self, bgra: np.ndarray) -> tuple[QColor, float] | None:
-        if bgra is None or bgra.ndim != 3 or bgra.shape[0] < 2 or bgra.shape[1] < 2:
-            return None
-        step_y = max(1, bgra.shape[0] // _SAMPLE_DIM)
-        step_x = max(1, bgra.shape[1] // _SAMPLE_DIM)
-        sample = bgra[::step_y, ::step_x, :3].astype(np.float32) / 255.0
-        blue, green, red = sample[..., 0], sample[..., 1], sample[..., 2]
-
-        def linearize(channel: np.ndarray) -> np.ndarray:
-            return np.where(channel <= 0.03928, channel / 12.92, ((channel + 0.055) / 1.055) ** 2.4)
-
-        luminance = 0.2126 * linearize(red) + 0.7152 * linearize(green) + 0.0722 * linearize(blue)
-        average = QColor(
-            min(255, round(float(red.mean()) * 255)),
-            min(255, round(float(green.mean()) * 255)),
-            min(255, round(float(blue.mean()) * 255)),
-        )
-        mean_luminance = float(luminance.mean())
-        luminance_range = float(luminance.max() - luminance.min())
-        bright_fraction = float((luminance > 0.68).mean())
-        dark_fraction = float((luminance < 0.16).mean())
-        mid_fraction = float(((luminance >= 0.24) & (luminance <= 0.76)).mean())
-        luminance_std = float(luminance.std())
-        color_std = float(((red.var() + green.var() + blue.var()) / 3.0) ** 0.5)
-
-        edge_x = np.abs(np.diff(luminance, axis=1))
-        edge_y = np.abs(np.diff(luminance, axis=0))
-        edge_count = edge_x.size + edge_y.size
-        edge_density = float((edge_x.sum() + edge_y.sum()) / edge_count) if edge_count else 0.0
-
-        terminal_like = (
-            mean_luminance < 0.32
-            and bright_fraction > 0.018
-            and dark_fraction > 0.48
-            and luminance_range > 0.54
-            and edge_density > 0.018
-        )
-        mixed_text_like = (
-            bright_fraction > 0.05
-            and dark_fraction > 0.18
-            and mid_fraction < 0.78
-            and luminance_range > 0.48
-            and edge_density > 0.02
-        )
-
-        complexity = min(
-            1.0,
-            max(
-                luminance_std * 3.1,
-                color_std * 2.35,
-                edge_density * 7.5,
-                bright_fraction * dark_fraction * luminance_range * 6.0,
-                luminance_std * 1.55 + color_std * 1.15 + edge_density * 3.6,
-                0.58 if terminal_like else 0.0,
-                0.46 if mixed_text_like else 0.0,
-            ),
-        )
-        return average, complexity
 
     def _resize_for_content(self, active: list[TodoItem], events: list[CalendarEvent] | None = None) -> None:
         events = events or []
@@ -2050,9 +1811,13 @@ class MemoWindow(OneGPUWidget):
         column_active = show_todo_ddl or bool(events)
         ddl_width = self._time_column_width(active, events, self._expanded) if column_active else 0
         ddl_reserve = (ddl_width + DDL_SEP_WIDTH + DDL_COL_GAPS) if column_active else 0
-        width = self._adaptive_width(active, events, screen, ddl_reserve)
-        text_width = self._text_width_for_window(width, ddl_reserve)
+        scrollbar_reserve = 0 if self._expanded else SCROLLBAR_LAYOUT_RESERVE
+        trailing_reserve = ddl_reserve + scrollbar_reserve
+        width = self._adaptive_width(active, events, screen, trailing_reserve)
+        text_width = self._text_width_for_window(width, trailing_reserve)
         content_height = sum(self._measure_row_height(todo.text, text_width, todo.location) for todo in active)
+        if self._surprise_row is not None:
+            content_height += self._surprise_row.height()
         if events:
             # Calendar rows render "📅 {summary}", which wraps (and grows taller than ROW_HEIGHT)
             # for long titles — measure them like todos so the window height isn't underestimated
@@ -2063,31 +1828,39 @@ class MemoWindow(OneGPUWidget):
         # The scrollable list adds top/bottom breathing room around the rows; budget it here so
         # the window grows to keep the first/last rows fully visible instead of squeezing them.
         content_height += 2 * LIST_EDGE_PAD
-        # Solve the window height so that, after the glass's proportional vertical padding, the
-        # top block + rows + corner margin still fit inside the glass: H*scale = needed.
+        # Window height = top block + rows + corner margin (scale is 1.0 for both static skins,
+        # kept here so the formula still reads generally).
         scale = self.skin.geometry_scale
         corner = self.skin.corner_margin
         needed = MEMO_TOP_BLOCK + content_height + 2 * corner
         wanted = max(MIN_HEIGHT, math.ceil(needed / scale))
-        screen_cap = screen.height() - 64
+        screen_cap = max(MIN_HEIGHT, screen.height() - 64)
+        self.setFixedWidth(width)
         if self._expanded:
             # Grow to fit everything; only the physical screen limits us. Hide the scrollbar
             # when it all fits, but fall back to AsNeeded if content still exceeds the screen.
             height = min(wanted, screen_cap)
             fits = wanted <= screen_cap
             self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff if fits else Qt.ScrollBarAsNeeded)
+            self.setFixedHeight(height)
         else:
-            height = min(wanted, int(screen.height() * MAX_HEIGHT_RATIO), screen_cap)
+            auto_height = min(wanted, int(screen.height() * MAX_HEIGHT_RATIO), screen_cap)
+            manual_height = self.app.state.window.manualHeight
+            try:
+                manual_height = int(manual_height) if manual_height is not None else None
+            except (TypeError, ValueError):
+                manual_height = None
+            height = max(MIN_HEIGHT, min(manual_height, screen_cap)) if manual_height is not None else auto_height
             self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            # Width remains content-driven and fixed, but the native HTBOTTOM edge may resize
+            # height anywhere inside the usable screen. resizeEvent persists only user drags.
+            self.setMinimumHeight(MIN_HEIGHT)
+            self.setMaximumHeight(screen_cap)
+            if self.height() != height:
+                self.resize(width, height)
 
-        if self.width() != width or self.height() != height:
-            self.update_sdf(width, height, radius_ratio=self.skin.radius_ratio, scale=scale)
-            if self.container:
-                self.container.setFixedSize(width, height)
-
-        # Inset the content to the glass. Vertical follows the proportional glass padding so the
-        # bottom rows never cross the glass edge; horizontal keeps OUTER_X, which at our width
-        # range always already exceeds the glass's horizontal padding (so no change there).
+        # Inset the content. Both skins fill the window (geometry_scale = 1.0 → vertical/horizontal
+        # padding are 0), so this collapses to OUTER_X horizontally and the corner margin vertically.
         pad_y = self.skin.vertical_padding(height)
         pad_x = max(OUTER_X, self.skin.horizontal_padding(width))
         self.layout.setContentsMargins(pad_x, pad_y + corner, pad_x, pad_y + corner)
@@ -2100,21 +1873,25 @@ class MemoWindow(OneGPUWidget):
         self._keep_inside_screen(screen)
         self.app.state.window.width = width
         self.app.state.window.height = height
+        controller = getattr(self.app, "floating", None)
+        if controller is not None:
+            controller.reposition_panel()
         if self._dock_edge is not None:
             # Content resized while docked: re-pin to the (recomputed) dock position so the peek
             # strip and slide geometry stay correct for the new size.
             self._reposition_dock()
 
     def _adaptive_width(self, active: list[TodoItem], events: list[CalendarEvent], screen: QRect, ddl_reserve: int = 0) -> int:
+        minimum = SURPRISE_MIN_WIDTH if getattr(self.app.surprise, "active", False) else MIN_WIDTH
         if not active and not events:
-            return MIN_WIDTH
+            return minimum
         metrics = QFontMetrics(mixed_font(12))
         text_widths = [metrics.horizontalAdvance(todo.text) for todo in active]
         text_widths += [metrics.horizontalAdvance(f"📅 {event.summary}") for event in events]
         longest = max(text_widths) if text_widths else 0
         chrome = OUTER_X * 2 + 12 + 18 + 30 + 28 + 24 + 40 + ddl_reserve  # +40: 编辑✎按钮 + 间距
         max_width = min(MAX_WIDTH, int(screen.width() * MAX_WIDTH_RATIO), screen.width() - 64)
-        return max(MIN_WIDTH, min(max_width, longest + chrome))
+        return max(minimum, min(max_width, longest + chrome))
 
     def _text_width_for_window(self, width: int, ddl_reserve: int = 0) -> int:
         # Must mirror _adaptive_width's chrome (incl. the +40 编辑✎按钮 reserve); otherwise the
@@ -2234,6 +2011,13 @@ class MemoWindow(OneGPUWidget):
         anim.finished.connect(lambda: self.app.archive_todo(todo_id))
         anim.start(QPropertyAnimation.DeleteWhenStopped)
 
+    def apply_surprise_theme(self, active: bool) -> None:
+        self._acrylic_signature = None
+        for button in (self.add_button, self.hide_button, self.expand_button):
+            button.apply_surprise_theme(active)
+        self.apply_settings(refresh_rows=True)
+        self.add_popup.apply_surprise_theme(active)
+
 
 class LiquidMemoApp:
     def __init__(self) -> None:
@@ -2251,12 +2035,15 @@ class LiquidMemoApp:
         self.save_timer = QTimer()
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.save)
+        self.surprise = SurpriseService(self)
         self.window = MemoWindow(self)
         self.settings_window = SettingsWindow(self)
         self.history_window = HistoryWindow(self)
         self.calendar = CalendarManager(self)
         self.notifier = NotificationManager(self)
         self.updater = UpdateManager(self)
+        self.floating = FloatingModeController(self)
+        self.surprise.bind_ui()
         self.tray_menu: QMenu | None = None
         self.tray = QSystemTrayIcon(tray_icon())
         self.tray.setToolTip("桌面备忘")
@@ -2265,9 +2052,11 @@ class LiquidMemoApp:
         self.qt.aboutToQuit.connect(self.shutdown)
 
     def run(self) -> int:
-        # showEvent already drives the initial geometry/refresh/recolor sequence; scheduling
-        # it again here only rebuilt the list and recolored it a second time.
-        self.window.show()
+        # Re-claim the launch-at-login entry for this exe if a different build (e.g. the
+        # portable copy, before this one was installed) had left it pointing elsewhere.
+        reconcile_startup()
+        # The mode controller decides whether startup shows the memo itself or only the launcher.
+        self.floating.start()
         # Kick off the first calendar sync once the event loop is about to run.
         QTimer.singleShot(0, self.calendar.start)
         # Start the reminder scan after the window/state have settled.
@@ -2320,11 +2109,14 @@ class LiquidMemoApp:
         menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
         menu.setAttribute(Qt.WA_TranslucentBackground)
         menu.setMinimumWidth(264)
+        menu_bg = "rgb(255,240,246)" if self.surprise.active else "rgb(251,252,254)"
+        menu_selected = "rgba(232,93,147,42)" if self.surprise.active else "rgba(0,103,192,30)"
+        menu_selected_text = SURPRISE_TEXT if self.surprise.active else "rgb(0,71,138)"
         menu.setStyleSheet(
             f"""
             QMenu {{
                 {FONT_STACK_QSS}
-                background-color: rgb(251, 252, 254);
+                background-color: {menu_bg};
                 color: rgb(24, 32, 40);
                 border: 1px solid rgba(17,24,32,26);
                 border-radius: 15px;
@@ -2340,8 +2132,8 @@ class LiquidMemoApp:
                 background-color: transparent;
             }}
             QMenu::item:selected {{
-                background-color: rgba(0, 103, 192, 30);
-                color: rgb(0, 71, 138);
+                background-color: {menu_selected};
+                color: {menu_selected_text};
             }}
             QMenu::icon {{
                 padding-left: 12px;
@@ -2356,8 +2148,11 @@ class LiquidMemoApp:
         self._add_tray_action(menu, FluentIcon.SETTING, "设置", self.show_settings)
         self._add_tray_action(menu, FluentIcon.HISTORY, "历史记录", self.show_history)
         menu.addSeparator()
-        label = "隐藏窗口" if self.window.isVisible() else "显示窗口"
-        icon = FluentIcon.HIDE if self.window.isVisible() else FluentIcon.VIEW
+        surfaces_visible = self.floating.surfaces_visible()
+        label = "隐藏悬浮窗" if surfaces_visible else "显示悬浮窗"
+        if self.state.settings.windowMode != "floatingLauncher":
+            label = "隐藏窗口" if surfaces_visible else "显示窗口"
+        icon = FluentIcon.HIDE if surfaces_visible else FluentIcon.VIEW
         self._add_tray_action(menu, icon, label, self.toggle_window)
         self._add_tray_action(menu, FluentIcon.POWER_BUTTON, "退出", self.quit)
         self.tray_menu = menu
@@ -2381,11 +2176,14 @@ class LiquidMemoApp:
         menu.addAction(action)
 
     def toggle_window(self) -> None:
-        if self.window.isVisible():
-            self.window.hide()
+        self.floating.toggle_surfaces()
+
+    def hide_memo_window(self) -> None:
+        """The memo's minus button collapses to the launcher in floating mode."""
+        if self.state.settings.windowMode == "floatingLauncher":
+            self.floating.collapse_panel()
         else:
-            self.window.show()
-            self.window.raise_()
+            self.window.hide()
 
     def show_settings(self) -> None:
         self.settings_window.sync_from_state()
@@ -2413,6 +2211,10 @@ class LiquidMemoApp:
 
     def shutdown(self) -> None:
         self.save()
+        try:
+            self.floating.stop()
+        except Exception:
+            pass
         try:
             self.window._wheel_hook.uninstall()
         except Exception:

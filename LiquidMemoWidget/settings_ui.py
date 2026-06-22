@@ -2,10 +2,11 @@
 Talks to the app only through the duck-typed `self.app` handle."""
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QPoint, QSize, Qt
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -32,7 +33,6 @@ from qfluentwidgets import (
     PrimaryPushButton,
     PushButton,
     RoundMenu,
-    Slider,
     SmoothScrollArea,
     SpinBox,
     SwitchButton,
@@ -55,6 +55,7 @@ from ui_common import (
     SETTING_TITLE_FONT_PX,
     add_soft_shadow,
     enlarge_control_font,
+    scaled_dialog_size,
     set_label_font,
 )
 from skin_editor import CropDialog, export_crop, image_open_filter, load_skin_pixmap
@@ -71,9 +72,10 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         super().__init__(None, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.app = app
         self._last_startup_checked = is_startup_enabled()
+        self._version_taps: list[float] = []
         self.setWindowTitle("设置")
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(1120, 860)
+        self.setFixedSize(scaled_dialog_size(1120, 860))
         self._build()
 
     def _build(self) -> None:
@@ -98,8 +100,8 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         add_soft_shadow(self.frame, blur=40, y=14, alpha=90)
 
         layout = QVBoxLayout(self.frame)
-        layout.setContentsMargins(30, 26, 30, 28)
-        layout.setSpacing(18)
+        layout.setContentsMargins(38, 34, 38, 36)
+        layout.setSpacing(24)
 
         header = QHBoxLayout()
         titles = QVBoxLayout()
@@ -129,9 +131,9 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         layout.addWidget(divider)
 
         body = QHBoxLayout()
-        body.setSpacing(18)
+        body.setSpacing(24)
         self.nav = QListWidget(self.frame)
-        self.nav.setFixedWidth(190)
+        self.nav.setFixedWidth(240)
         self.nav.setFrameShape(QFrame.NoFrame)
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.nav.setStyleSheet(
@@ -169,19 +171,14 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         self._section("外观")
         self.skin = self._combo_row(
             "皮肤",
-            "磨砂玻璃更省性能、文字更易读，推荐低配电脑使用；液态玻璃为实时折射特效；"
-            "图片皮肤使用你上传的图片作为静态背景。",
-            {"磨砂玻璃（推荐）": "acrylic", "液态玻璃": "glass"},
+            "磨砂玻璃省性能、文字易读，是默认皮肤；图片皮肤使用你上传的图片作为静态背景。",
+            {"磨砂玻璃（推荐）": "acrylic"},
             self.app.state.settings.skin,
         )
         self._refresh_skin_combo()  # append any saved image skins + select the active one
         self.skin.currentIndexChanged.connect(self._apply)
         self._image_skins_card()
-        self.opacity, self.opacity_value = self._slider_row("透明光泽", "控制玻璃底色染色强度，越低越通透。", int(self.app.state.settings.glassOpacity * 100), 0, 38, "%")
-        self.opacity.valueChanged.connect(lambda value: self._slider_changed(self.opacity_value, value, "%"))
-        self.strength, self.strength_value = self._slider_row("液态强度", "调节边缘折射、色散和高光的存在感。", int(self.app.state.settings.liquidStrength * 100), 20, 140, "%")
-        self.strength.valueChanged.connect(lambda value: self._slider_changed(self.strength_value, value, "%"))
-        self.window_color = self._color_row("窗口颜色", "控制液态玻璃的低饱和背景染色。", self.app.state.settings.windowTint)
+        self.window_color = self._color_row("窗口颜色", "控制磨砂玻璃的低饱和背景染色。", self.app.state.settings.windowTint)
         self.text_color = self._color_row("待办字体颜色", "选择后自动切到手动颜色，并立即应用到普通待办。", self.app.state.settings.todoTextColor, True)
         self.urgent_color = self._color_row("加急字体颜色", "选择后自动切到手动颜色，并立即应用到加急待办。", self.app.state.settings.urgentTextColor, True)
         self.font_mode = self._combo_row(
@@ -199,11 +196,14 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         self.position.currentIndexChanged.connect(self._apply)
         self.startup = self._switch_row("开机自启动", "登录 Windows 后自动启动桌面备忘。", self._last_startup_checked)
         self.startup.checkedChanged.connect(lambda _checked: self._apply())
-        self.edge_autohide = self._switch_row(
-            "贴边自动隐藏", "把窗口拖到屏幕左/右/上边缘即停靠，鼠标离开后自动滑出隐藏，移回边缘再滑回。",
-            self.app.state.settings.edgeAutoHide,
+        self.window_mode = self._combo_row(
+            "窗口显示模式",
+            "普通窗口持续显示；贴边隐藏会滑出屏幕；悬浮图标点击后展开，移开后自动收回。",
+            {"普通悬浮窗口": "normal", "贴边自动隐藏": "edgeHide", "悬浮图标": "floatingLauncher"},
+            self.app.state.settings.windowMode,
         )
-        self.edge_autohide.checkedChanged.connect(lambda _checked: self._apply())
+        self._nav_base_style = self.nav.styleSheet()
+        self.window_mode.currentIndexChanged.connect(self._apply)
 
         self._section("提醒")
         self.notify_enabled = self._switch_row(
@@ -216,6 +216,11 @@ class SettingsWindow(FramelessDragMixin, QDialog):
             self.app.state.settings.notifyMinutesBefore, 1, 1440,
         )
         self.notify_minutes.valueChanged.connect(lambda _value: self._apply())
+        self.near_highlight_days = self._spinbox_row(
+            "临期高亮（天）", "待办截止或日程开始前这么多天，时间会显示为橙色。",
+            self.app.state.settings.nearHighlightDays, 1, 30,
+        )
+        self.near_highlight_days.valueChanged.connect(lambda _value: self._apply())
 
         self._section("日历订阅")
         self.calendar_enabled = self._switch_row(
@@ -234,9 +239,17 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         enlarge_control_font(github_link)
         self.form.addWidget(FluentSettingRow("项目主页", "查看源码、提交反馈或为项目点个 Star。", github_link))
         self._update_row()
+        self._surprise_status_row()
+        self.auto_update = self._switch_row(
+            "自动检查更新", "启动后在后台检查新版本（每 12 小时一次）；关闭后仅在点击「检查更新」时检查。",
+            self.app.state.settings.autoCheckUpdates,
+        )
+        self.auto_update.checkedChanged.connect(lambda _checked: self._apply())
 
         self.form.addStretch()
         self.nav.setCurrentRow(0)
+        surprise = getattr(self.app, "surprise", None)
+        self.apply_surprise_theme(bool(surprise and surprise.active))
 
     def _section(self, title: str) -> None:
         # Each section becomes a nav entry + its own scrollable page; the row helpers
@@ -258,50 +271,27 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         page = QWidget()
         page.setStyleSheet("background: transparent;")
         self.form = QVBoxLayout(page)
-        self.form.setContentsMargins(0, 2, 8, 2)
-        self.form.setSpacing(10)
+        self.form.setContentsMargins(0, 4, 12, 4)
+        self.form.setSpacing(14)
         scroll.setWidget(page)
         self.stack.addWidget(scroll)
         item = QListWidgetItem(title)
-        item.setSizeHint(QSize(0, 52))
+        item.setSizeHint(QSize(0, 66))
         self.nav.addItem(item)
-
-    def _slider_row(self, title: str, content: str, value: int, minimum: int, maximum: int, suffix: str) -> tuple[Slider, BodyLabel]:
-        control = QWidget()
-        control.setFixedWidth(280)
-        layout = QHBoxLayout(control)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-        slider = Slider(Qt.Horizontal)
-        slider.setRange(minimum, maximum)
-        slider.setValue(value)
-        slider.setThemeColor("#0067C0", "#4CC2FF")
-        value_label = BodyLabel(f"{value}{suffix}")
-        set_label_font(value_label, SETTING_STATUS_FONT_PX)
-        value_label.setFixedWidth(58)
-        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        layout.addWidget(slider, 1)
-        layout.addWidget(value_label)
-        self.form.addWidget(FluentSettingRow(title, content, control))
-        return slider, value_label
-
-    def _slider_changed(self, label: BodyLabel, value: int, suffix: str) -> None:
-        label.setText(f"{value}{suffix}")
-        self._apply()
 
     def _color_row(self, title: str, content: str, color: str, activates_manual_text_color: bool = False) -> QWidget:
         control = QWidget()
         control.setProperty("selectedColor", color)
         control.setProperty("activatesManualTextColor", activates_manual_text_color)
-        control.setFixedWidth(250)
+        control.setFixedWidth(330)
         layout = QHBoxLayout(control)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         swatch = QFrame()
         swatch.setObjectName("colorSwatch")
-        swatch.setFixedSize(30, 30)
+        swatch.setFixedSize(38, 38)
         button = PushButton(color, control, FluentIcon.PALETTE)
-        button.setFixedWidth(195)
+        button.setFixedWidth(265)
         enlarge_control_font(button)
         button.clicked.connect(lambda: self._pick_color(control, swatch, button, title))
         layout.addWidget(swatch)
@@ -317,7 +307,7 @@ class SettingsWindow(FramelessDragMixin, QDialog):
 
     def _combo_row(self, title: str, content: str, options: dict[str, str], current: str) -> ComboBox:
         combo = ComboBox()
-        combo.setFixedWidth(280)
+        combo.setFixedWidth(360)
         enlarge_control_font(combo)
         for text, data in options.items():
             combo.addItem(text, userData=data)
@@ -507,14 +497,14 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         spin = SpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
-        spin.setFixedWidth(140)
+        spin.setFixedWidth(180)
         enlarge_control_font(spin)
         self.form.addWidget(FluentSettingRow(title, content, spin))
         return spin
 
     def _calendar_status_row(self) -> None:
         control = QWidget()
-        control.setFixedWidth(340)
+        control.setFixedWidth(440)
         layout = QHBoxLayout(control)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
@@ -531,19 +521,69 @@ class SettingsWindow(FramelessDragMixin, QDialog):
 
     def _update_row(self) -> None:
         control = QWidget()
-        control.setFixedWidth(340)
+        control.setFixedWidth(440)
         layout = QHBoxLayout(control)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         self.update_status_label = BodyLabel(f"当前版本 v{APP_VERSION}")
         self.update_status_label.setWordWrap(True)
         self.update_status_label.setStyleSheet(f"{FONT_STACK_QSS} color: rgba(17,24,32,150); font-size: {SETTING_STATUS_FONT_PX}px;")
+        self.update_status_label.installEventFilter(self)
         check_button = PushButton("检查更新", control, FluentIcon.SYNC)
         check_button.clicked.connect(lambda: self.app.updater.check(silent=False))
         enlarge_control_font(check_button)
         layout.addWidget(self.update_status_label, 1)
         layout.addWidget(check_button)
         self.form.addWidget(FluentSettingRow("检查更新", "从 GitHub Releases 获取新版本，自动下载并安装。", control))
+
+    def _surprise_status_row(self) -> None:
+        control = QWidget()
+        control.setFixedWidth(440)
+        layout = QHBoxLayout(control)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.surprise_status_label = BodyLabel("特别模式已激活")
+        set_label_font(self.surprise_status_label, SETTING_STATUS_FONT_PX)
+        restore = PushButton("恢复普通模式", control, FluentIcon.RETURN)
+        enlarge_control_font(restore)
+        restore.clicked.connect(lambda: getattr(self.app, "surprise", None) and self.app.surprise.deactivate())
+        layout.addWidget(self.surprise_status_label, 1)
+        layout.addWidget(restore)
+        self.surprise_row = FluentSettingRow("特别模式", "清除本机保存的专属密钥并恢复原主题。", control)
+        self.form.addWidget(self.surprise_row)
+        self.sync_surprise_state()
+
+    def sync_surprise_state(self) -> None:
+        if hasattr(self, "surprise_row"):
+            surprise = getattr(self.app, "surprise", None)
+            self.surprise_row.setVisible(bool(surprise and surprise.active))
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is getattr(self, "update_status_label", None) and event.type() == QEvent.MouseButtonPress:
+            surprise = getattr(self.app, "surprise", None)
+            if event.button() == Qt.LeftButton and surprise is not None and not surprise.active:
+                now = time.monotonic()
+                self._version_taps = [stamp for stamp in self._version_taps if now - stamp <= 5.0]
+                self._version_taps.append(now)
+                if len(self._version_taps) >= 7:
+                    self._version_taps.clear()
+                    surprise.show_activation_dialog(self)
+                return True
+        return super().eventFilter(watched, event)
+
+    def apply_surprise_theme(self, active: bool) -> None:
+        top = "#FFF8FB" if active else "rgb(252,253,255)"
+        bottom = "#FFE3EC" if active else "rgb(240,244,250)"
+        self.frame.setStyleSheet(
+            f"QFrame#fluentPanel {{ {FONT_STACK_QSS} background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {top},stop:1 {bottom}); border: 1px solid rgba(255,255,255,210); border-radius: 22px; }}"
+            " QFrame#colorSwatch { border: 1px solid rgba(17,24,32,38); border-radius: 9px; }"
+        )
+        selected_bg = "rgba(232,93,147,42)" if active else "rgba(0,103,192,30)"
+        selected_text = "#7A2447" if active else "rgb(0,71,138)"
+        self.nav.setStyleSheet(
+            self._nav_base_style
+            + f" QListWidget::item:selected {{ background: {selected_bg}; color: {selected_text}; }}"
+        )
+        self.sync_surprise_state()
 
     def set_update_status(self, text: str) -> None:
         if hasattr(self, "update_status_label"):
@@ -599,14 +639,13 @@ class SettingsWindow(FramelessDragMixin, QDialog):
 
     # ── Image skins (custom background pictures) ──────────────────────────────────────────
     def _refresh_skin_combo(self) -> None:
-        """Rebuild the skin picker: the two built-ins plus one entry per saved image skin. The
-        built-ins are always present and never removable; image skins reflect customSkins. Run
+        """Rebuild the skin picker: the built-in frost skin plus one entry per saved image skin.
+        The built-in is always present and never removable; image skins reflect customSkins. Run
         with signals blocked so rebuilding never fires _apply."""
         combo = self.skin
         blocked = combo.blockSignals(True)
         combo.clear()
         combo.addItem("磨砂玻璃（推荐）", userData="acrylic")
-        combo.addItem("液态玻璃", userData="glass")
         for skin in self.app.state.settings.customSkins:
             combo.addItem(skin.name or "未命名图片", userData=f"image:{skin.id}")
         index = combo.findData(self.app.state.settings.skin)
@@ -632,7 +671,7 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         info.setCursor(Qt.WhatsThisCursor)
         info.setToolTip(
             "上传一张图片并裁切，保存为静态背景皮肤；保存后可在上方「皮肤」中选择。"
-            "内置的磨砂玻璃 / 液态玻璃不可删除。"
+            "内置的磨砂玻璃皮肤不可删除。"
         )
         info.installEventFilter(InfoToolTipFilter(info, showDelay=200, position=ToolTipPosition.TOP))
         header.addWidget(info)
@@ -746,23 +785,19 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         settings = self.app.state.settings
         blockers = [
             self.skin.blockSignals(True),
-            self.opacity.blockSignals(True),
-            self.strength.blockSignals(True),
             self.font_mode.blockSignals(True),
             self.complete.blockSignals(True),
             self.position.blockSignals(True),
             self.startup.blockSignals(True),
-            self.edge_autohide.blockSignals(True),
+            self.window_mode.blockSignals(True),
             self.notify_enabled.blockSignals(True),
             self.notify_minutes.blockSignals(True),
+            self.near_highlight_days.blockSignals(True),
             self.calendar_enabled.blockSignals(True),
             self.calendar_days.blockSignals(True),
+            self.auto_update.blockSignals(True),
         ]
         self._refresh_skin_combo()  # rebuild entries (custom skins may have changed) + reselect
-        self.opacity.setValue(int(settings.glassOpacity * 100))
-        self.opacity_value.setText(f"{self.opacity.value()}%")
-        self.strength.setValue(int(settings.liquidStrength * 100))
-        self.strength_value.setText(f"{self.strength.value()}%")
         self._set_color_control(self.window_color, settings.windowTint)
         self._set_color_control(self.text_color, settings.todoTextColor)
         self._set_color_control(self.urgent_color, settings.urgentTextColor)
@@ -771,17 +806,21 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         self.position.setCurrentIndex(max(0, self.position.findData(self.app.state.window.startPosition)))
         self._last_startup_checked = is_startup_enabled()
         self.startup.setChecked(self._last_startup_checked)
-        self.edge_autohide.setChecked(settings.edgeAutoHide)
+        self.window_mode.setCurrentIndex(max(0, self.window_mode.findData(settings.windowMode)))
         self.notify_enabled.setChecked(settings.notificationsEnabled)
         self.notify_minutes.setValue(settings.notifyMinutesBefore)
+        self.near_highlight_days.setValue(settings.nearHighlightDays)
         self.calendar_enabled.setChecked(settings.calendarEnabled)
         self.calendar_days.setValue(settings.calendarSyncDays)
+        self.auto_update.setChecked(settings.autoCheckUpdates)
         self.refresh_feed_list()
         self.refresh_image_skin_list()
         self.refresh_calendar_status()
+        self.sync_surprise_state()
         for widget, blocked in zip(
-            [self.skin, self.opacity, self.strength, self.font_mode, self.complete, self.position, self.startup,
-             self.edge_autohide, self.notify_enabled, self.notify_minutes, self.calendar_enabled, self.calendar_days],
+            [self.skin, self.font_mode, self.complete, self.position, self.startup,
+             self.window_mode, self.notify_enabled, self.notify_minutes, self.near_highlight_days,
+             self.calendar_enabled, self.calendar_days, self.auto_update],
             blockers,
         ):
             widget.blockSignals(blocked)
@@ -803,33 +842,28 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         defaults = Settings()
         settings = self.app.state.settings
         settings.skin = defaults.skin
-        settings.glassOpacity = defaults.glassOpacity
-        settings.liquidStrength = defaults.liquidStrength
         settings.windowTint = defaults.windowTint
         settings.todoTextColor = defaults.todoTextColor
         settings.urgentTextColor = defaults.urgentTextColor
         settings.fontColorMode = defaults.fontColorMode
         self.sync_from_state()
         self._apply(save_now=True)
-        # _apply already drove the skin transition; only the glass pipeline needs a hard reset
-        # (the acrylic skin runs no capture loop, so resetting it would only spin a no-op timer).
-        if self.app.state.settings.skin == "glass":
-            self.app.window.reset_capture_pipeline("reset-defaults")
 
     def _apply(self, *_args, save_now: bool = False) -> None:
         settings = self.app.state.settings
+        window_mode_before = settings.windowMode
         settings.skin = str(self.skin.currentData())
-        settings.glassOpacity = self.opacity.value() / 100
-        settings.liquidStrength = self.strength.value() / 100
         settings.windowTint = self._control_color(self.window_color, settings.windowTint)
         settings.todoTextColor = self._control_color(self.text_color, settings.todoTextColor)
         settings.urgentTextColor = self._control_color(self.urgent_color, settings.urgentTextColor)
         settings.fontColorMode = str(self.font_mode.currentData())
         settings.completeBehavior = str(self.complete.currentData())
         settings.layerMode = "alwaysVisibleClickThrough"
-        settings.edgeAutoHide = self.edge_autohide.isChecked()
+        settings.windowMode = str(self.window_mode.currentData())
         settings.notificationsEnabled = self.notify_enabled.isChecked()
         settings.notifyMinutesBefore = int(self.notify_minutes.value())
+        settings.nearHighlightDays = int(self.near_highlight_days.value())
+        settings.autoCheckUpdates = self.auto_update.isChecked()
         self.app.state.window.startPosition = str(self.position.currentData())
         if self.app.state.window.startPosition == "current":
             self.app.state.window.x = self.app.window.x()
@@ -852,6 +886,10 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         else:
             self.app.save_later()
         self.app.window.apply_settings()
+        if window_mode_before != settings.windowMode:
+            controller = getattr(self.app, "floating", None)
+            if controller is not None:
+                controller.apply_mode()
         if calendar_changed:
             self.app.calendar.on_settings_changed()
         # Re-scan so toggling on / lowering the lead time reminds immediately; no-ops when

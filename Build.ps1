@@ -13,12 +13,16 @@ python -m PyInstaller `
   --collect-all qfluentwidgets `
   --collect-all icalendar `
   --collect-all recurring_ical_events `
+  --collect-all cryptography `
   --collect-submodules dateutil `
   --collect-data tzdata `
-  --hidden-import numpy `
   --hidden-import xml.etree.ElementTree `
+  --hidden-import hashlib `
+  --hidden-import base64 `
+  --hidden-import ctypes `
+  --hidden-import json `
+  --hidden-import os `
   --icon "$root\assets\logo.ico" `
   --add-data "$root\assets\logo.ico;assets" `
   --add-data "$root\LiquidMemoWidget;LiquidMemoWidget" `
-  --add-data "$root\WindowsLiquidGlass;WindowsLiquidGlass" `
   (Join-Path $root "RunLiquidMemoWidget.pyw")

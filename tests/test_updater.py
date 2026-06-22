@@ -1,9 +1,27 @@
 """Pure-logic tests for the updater: version comparison, installer/helper command
-assembly, release-asset selection, and the apply_update flow (subprocess mocked).
-No Qt, no network, no real process spawning."""
+assembly, release-asset selection, checksum verification, portable detection, and the
+apply_update flow (subprocess mocked). No Qt, no network, no real process spawning."""
 from pathlib import Path
 
+import pytest
+
 import updater
+
+
+class _FakeResponse:
+    """Minimal urlopen() stand-in: a context manager exposing read()."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        return False
+
+    def read(self, *_args) -> bytes:
+        return self._data
 
 
 def test_parse_version_and_is_newer():
@@ -44,6 +62,82 @@ def test_release_from_payload_picks_setup_exe():
     assert rel.installer_name.endswith("Setup-v2.3.4.exe")
     assert rel.installer_url == "s"
     assert rel.installer_size == 99
+    assert rel.checksum_url == ""  # no sidecar in this release
+
+
+def test_release_from_payload_captures_checksum_sidecar():
+    payload = {
+        "tag_name": "v2.3.4",
+        "assets": [
+            {"name": "LiquidMemoWidget-Setup-v2.3.4.exe", "browser_download_url": "s", "size": 5},
+            {"name": "LiquidMemoWidget-Setup-v2.3.4.exe.sha256", "browser_download_url": "c", "size": 1},
+        ],
+    }
+    rel = updater._release_from_payload(payload)
+    assert rel.installer_url == "s"
+    assert rel.checksum_url == "c"
+
+
+def test_parse_expected_sha256_accepts_sha256sum_and_bare_forms():
+    digest = "a" * 64
+    assert updater._parse_expected_sha256(f"{digest}  LiquidMemoWidget-Setup.exe") == digest
+    assert updater._parse_expected_sha256(digest.upper()) == digest  # normalized to lowercase
+    assert updater._parse_expected_sha256("not-a-hash") == ""
+    assert updater._parse_expected_sha256("") == ""
+
+
+def test_sha256_file_matches_hashlib(tmp_path):
+    import hashlib
+
+    blob = b"liquid-memo-widget" * 4096
+    f = tmp_path / "blob.bin"
+    f.write_bytes(blob)
+    assert updater.sha256_file(f) == hashlib.sha256(blob).hexdigest()
+
+
+def test_verify_installer_checksum_pass_fail_and_skip(tmp_path, monkeypatch):
+    installer = tmp_path / "Setup.exe"
+    installer.write_bytes(b"installer-bytes")
+    digest = updater.sha256_file(installer)
+    rel = updater.ReleaseInfo(
+        tag="v1", version="1", notes="", html_url="",
+        installer_url="u", installer_name="Setup.exe", installer_size=0,
+        checksum_url="https://example/Setup.exe.sha256",
+    )
+
+    # Matching hash: passes silently.
+    monkeypatch.setattr(updater.urllib.request, "urlopen",
+                        lambda req, **k: _FakeResponse(f"{digest}  Setup.exe".encode()))
+    updater.verify_installer_checksum(installer, rel)
+
+    # Wrong hash: must raise.
+    monkeypatch.setattr(updater.urllib.request, "urlopen",
+                        lambda req, **k: _FakeResponse(f"{'0' * 64}  Setup.exe".encode()))
+    with pytest.raises(RuntimeError):
+        updater.verify_installer_checksum(installer, rel)
+
+    # No sidecar published: skipped (no raise, no network).
+    rel.checksum_url = ""
+    updater.verify_installer_checksum(installer, rel)
+
+    # Sidecar URL present but unfetchable (e.g. atom-reconstructed URL for a pre-sidecar
+    # release that 404s): skip rather than fail-closed, so the update isn't blocked.
+    rel.checksum_url = "https://example/missing.sha256"
+
+    def boom(*_a, **_k):
+        raise OSError("404")
+
+    monkeypatch.setattr(updater.urllib.request, "urlopen", boom)
+    updater.verify_installer_checksum(installer, rel)  # no raise
+
+
+def test_is_portable_build_detects_marker(tmp_path, monkeypatch):
+    exe = tmp_path / "LiquidMemoWidget.exe"
+    exe.write_text("stub")
+    monkeypatch.setattr(updater.sys, "executable", str(exe))
+    assert updater.is_portable_build() is False
+    (tmp_path / updater.PORTABLE_MARKER).write_text("portable")
+    assert updater.is_portable_build() is True
 
 
 def test_apply_update_waits_installs_cleans_and_relaunches(tmp_path, monkeypatch):

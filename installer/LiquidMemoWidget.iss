@@ -44,6 +44,13 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 [Files]
 Source: "..\dist\LiquidMemoWidget\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[Registry]
+; Auto-start is a user preference the app writes at runtime (startup.py), so the installer must
+; NOT create or modify it at install time (ValueType: none = leave it alone). We only delete it
+; on uninstall so the HKCU\...\Run "LiquidMemoWidget" value isn't left orphaned, pointing at a
+; now-removed exe.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "LiquidMemoWidget"; Flags: uninstalldeletevalue
+
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"

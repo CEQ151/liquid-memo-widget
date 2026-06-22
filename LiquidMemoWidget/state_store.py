@@ -111,6 +111,13 @@ class WindowState:
     y: int | None = None
     width: int = 320
     height: int = 320
+    # User-dragged height (bottom-edge resize) in collapsed mode; None means auto-fit to content.
+    # Double-clicking the bottom edge clears it. Clamped to the screen at use-time.
+    manualHeight: int | None = None
+    # Independent position of the floating-launcher bubble. None uses the default position on
+    # the primary screen; stale/off-screen values are clamped when the launcher is shown.
+    launcherX: int | None = None
+    launcherY: int | None = None
     startPosition: str = "topRight"
     visible: bool = True
 
@@ -163,15 +170,13 @@ class CustomSkin:
 @dataclass
 class Settings:
     # Rendering skin. "acrylic" is a lightweight DWM frosted-glass surface (no GPU screen
-    # capture) for low-end PCs and is the default; "glass" is the original real-time D3D
-    # liquid-glass refraction; "image:<id>" selects a user-created CustomSkin (a static image
+    # capture) and is the default; "image:<id>" selects a user-created CustomSkin (a static image
     # background, see customSkins). Any unrecognized value normalizes to "acrylic" in from_dict.
+    # (The old real-time D3D "glass" skin was removed.)
     skin: str = "acrylic"
     # User-created image-background skins, each selectable as "image:<id>". The built-in
-    # acrylic/glass skins are not in this list and cannot be deleted.
+    # acrylic skin is not in this list and cannot be deleted.
     customSkins: list[CustomSkin] = field(default_factory=list)
-    glassOpacity: float = 0.0
-    liquidStrength: float = 1.0
     windowTint: str = "#FFFFFF"
     todoTextColor: str = "#111820"
     urgentTextColor: str = "#FF0000"
@@ -179,9 +184,9 @@ class Settings:
     completeBehavior: str = "archive"
     layerMode: str = "alwaysVisibleClickThrough"
     startWithWindows: bool = False
-    # When True, dragging the window to a screen edge docks it and it auto-hides off-screen
-    # (leaving a thin peek strip) until the cursor returns to that strip.
-    edgeAutoHide: bool = True
+    # Window presentation: regular memo, edge-docked auto-hide, or a small floating launcher
+    # that opens the memo on demand. Older edgeAutoHide states migrate in AppState.from_dict.
+    windowMode: str = "edgeHide"
     # Calendar subscription: when enabled, the widget syncs the next `calendarSyncDays` days of
     # events from the checked ICS/webcal feeds and shows them in a separate "日程" group.
     # Deleted feeds move to `calendarFeedArchive` so an accidental deletion can be restored.
@@ -194,6 +199,10 @@ class Settings:
     # deadline. All-day events instead remind once on the day (see notify_manager).
     notificationsEnabled: bool = False
     notifyMinutesBefore: int = 15
+    # Days before a deadline/event start when its time cell turns amber ("near"). Applies to
+    # both todo DDLs and subscribed calendar events; overdue stays red regardless. 1 == the
+    # original fixed 24h window.
+    nearHighlightDays: int = 1
     # Version of the app on its previous run; when it differs from the current
     # APP_VERSION the app shows the new version's changelog once after an update.
     lastRunVersion: str = ""
@@ -201,6 +210,20 @@ class Settings:
     # next launch. If the running version did not advance, the install failed and the
     # app surfaces an "update failed" notice (see update_ui.UpdateManager.on_startup).
     pendingUpdateVersion: str = ""
+    # Auto-update preferences. When `autoCheckUpdates` is off the app only checks when the
+    # user clicks "检查更新". The silent startup check is throttled to once every few hours
+    # (see update_ui) using `lastUpdateCheckAt` (ISO-8601 UTC). `lastDismissedUpdateVersion`
+    # remembers the version the user clicked "稍后再说" on, so a silent check won't re-prompt
+    # for it across runs until a newer version appears (a manual check always prompts).
+    autoCheckUpdates: bool = True
+    lastUpdateCheckAt: str = ""
+    lastDismissedUpdateVersion: str = ""
+    surpriseEnabled: bool = False
+    surpriseKeyBlob: str = ""
+    preSurpriseWindowMode: str = ""
+    surpriseCompletedDate: str = ""
+    surpriseNoteDate: str = ""
+    surpriseNoteIndex: int = -1
 
     def active_calendar_feeds(self) -> list[CalendarFeed]:
         """Feeds that are checked and have a URL — the only ones synced and displayed."""
@@ -244,7 +267,7 @@ class CalendarEvent:
 
 @dataclass
 class AppState:
-    version: int = 4
+    version: int = 6
     settings: Settings = field(default_factory=Settings)
     window: WindowState = field(default_factory=WindowState)
     todos: list[TodoItem] = field(default_factory=list)
@@ -265,17 +288,32 @@ class AppState:
         settings_data = dict(data.get("settings") or {})
         window_data = dict(data.get("window") or {})
         settings = Settings(**{key: settings_data.get(key, value) for key, value in settings_defaults.items()})
+        # v4 -> v5: replace the edge-auto-hide boolean with one explicit three-way mode. Preserve
+        # existing behavior exactly for upgraded users; new installs default to edgeHide above.
+        if "windowMode" not in settings_data:
+            settings.windowMode = "edgeHide" if bool(settings_data.get("edgeAutoHide", True)) else "normal"
+        if settings.windowMode not in {"normal", "edgeHide", "floatingLauncher"}:
+            settings.windowMode = "edgeHide"
         if settings.layerMode != "alwaysVisibleClickThrough":
             settings.layerMode = "alwaysVisibleClickThrough"
         # The generic loop above leaves dataclass lists as raw dicts; rebuild them typed
         # (customSkins first so the skin whitelist below can validate an "image:<id>" against it).
         settings.customSkins = [CustomSkin.from_dict(item) for item in settings_data.get("customSkins") or []]
-        valid_skins = {"acrylic", "glass"} | {f"image:{s.id}" for s in settings.customSkins}
+        # The "glass" (real-time D3D liquid-glass) skin was removed; it is intentionally absent
+        # from valid_skins so any saved "glass" selection normalizes back to the frost skin below.
+        valid_skins = {"acrylic"} | {f"image:{s.id}" for s in settings.customSkins}
         if settings.skin not in valid_skins:
             settings.skin = "acrylic"
         settings.calendarSyncDays = max(1, min(30, int(settings.calendarSyncDays or 7)))
         settings.notificationsEnabled = bool(settings.notificationsEnabled)
+        settings.autoCheckUpdates = bool(settings.autoCheckUpdates)
         settings.notifyMinutesBefore = max(1, min(1440, int(settings.notifyMinutesBefore or 15)))
+        settings.nearHighlightDays = max(1, min(30, int(settings.nearHighlightDays or 1)))
+        settings.surpriseEnabled = bool(settings.surpriseEnabled)
+        try:
+            settings.surpriseNoteIndex = int(settings.surpriseNoteIndex)
+        except (TypeError, ValueError):
+            settings.surpriseNoteIndex = -1
         settings.calendarFeeds = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeeds") or []]
         settings.calendarFeedArchive = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeedArchive") or []]
         window = WindowState(**{key: window_data.get(key, value) for key, value in window_defaults.items()})
@@ -296,7 +334,7 @@ class AppState:
                     event.key = f"{feed.id}|{event.key}"
             done_keys = [f"{feed.id}|{key}" for key in done_keys]
         return AppState(
-            version=4,
+            version=6,
             settings=settings,
             window=window,
             todos=todos,

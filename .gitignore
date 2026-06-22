@@ -18,3 +18,7 @@ venv/
 *.bak
 *.bad-*.json
 
+# Personalized surprise-mode source; commit only the generated encrypted payload.
+private/
+*.surprise.json
+

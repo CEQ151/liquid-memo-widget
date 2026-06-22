@@ -80,6 +80,15 @@ function Assert-AppBuild {
   }
 }
 
+function Write-Sha256Sidecar {
+  # Emit a "<hash>  <filename>" sidecar (sha256sum layout) next to $Path. The in-app updater
+  # downloads this for the installer and verifies it before running the silent install.
+  param([string]$Path)
+  $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+  $name = Split-Path -Leaf $Path
+  "$hash  $name" | Set-Content -LiteralPath "$Path.sha256" -Encoding ascii -NoNewline
+}
+
 $appVersion = Resolve-AppVersion -RequestedVersion $Version
 $env:APP_VERSION = $appVersion
 
@@ -105,7 +114,14 @@ if (Test-Path -LiteralPath $portablePath) {
 
 Write-Host ""
 Write-Host "==> Creating portable zip"
+# Drop a marker the runtime uses to recognize the portable build (so it offers a manual
+# download instead of silently running the installer over itself). It must be in the zip but
+# NOT in the installer, so write it just for the zip and remove it before Inno builds below.
+$portableFlag = Join-Path $appDir "portable.flag"
+"portable" | Set-Content -LiteralPath $portableFlag -Encoding ascii -NoNewline
 Compress-Archive -Path (Join-Path $appDir "*") -DestinationPath $portablePath -CompressionLevel Optimal -Force
+Remove-Item -LiteralPath $portableFlag -Force
+Write-Sha256Sidecar -Path $portablePath
 
 $installerPath = Join-Path $installerDir "$appName-Setup-v$appVersion.exe"
 
@@ -118,6 +134,7 @@ if (-not $SkipInstaller) {
   if (-not (Test-Path -LiteralPath $installerPath)) {
     throw "Installer output was not found: $installerPath"
   }
+  Write-Sha256Sidecar -Path $installerPath
 }
 
 Write-Host ""

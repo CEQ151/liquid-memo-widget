@@ -34,10 +34,12 @@ SWP_SHOWWINDOW = 0x0040
 
 WM_NCHITTEST = 0x0084
 WM_NCLBUTTONDOWN = 0x00A1
+WM_NCLBUTTONDBLCLK = 0x00A3
 WM_ENTERSIZEMOVE = 0x0231
 WM_EXITSIZEMOVE = 0x0232
 HTCLIENT = 1
 HTCAPTION = 2
+HTBOTTOM = 15
 HTTRANSPARENT = -1
 
 ReleaseCapture = user32.ReleaseCapture
@@ -55,6 +57,23 @@ GetWindowRect.restype = wintypes.BOOL
 GetParent = user32.GetParent
 GetParent.argtypes = [wintypes.HWND]
 GetParent.restype = wintypes.HWND
+
+SetWindowDisplayAffinity = user32.SetWindowDisplayAffinity
+SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+SetWindowDisplayAffinity.restype = wintypes.BOOL
+
+WDA_NONE = 0x00000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+
+def set_window_exclude_from_capture(hwnd: int, exclude: bool = True) -> bool:
+    """Toggle WDA_EXCLUDEFROMCAPTURE on the window (SetWindowDisplayAffinity), keeping the
+    content layer out of any screen capture. Previously vendored in the D3D engine; kept here
+    as a plain Win32 helper now that the engine is gone."""
+    if not hwnd:
+        return False
+    affinity = WDA_EXCLUDEFROMCAPTURE if exclude else WDA_NONE
+    return bool(SetWindowDisplayAffinity(wintypes.HWND(hwnd), affinity))
 
 
 def apply_tool_window(hwnd: int) -> None:

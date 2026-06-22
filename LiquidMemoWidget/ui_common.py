@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPixmap
-from PySide6.QtWidgets import QGraphicsDropShadowEffect, QHBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QGraphicsDropShadowEffect, QHBoxLayout, QWidget
 from qfluentwidgets import (
     BodyLabel,
     CardWidget,
@@ -116,13 +116,37 @@ def tray_icon() -> QIcon:
 # Settings / dialog typography. Chinese renders in Microsoft YaHei, Latin in Times New Roman
 # (a serif face — sizes are kept generous so it stays readable), and nothing is bold per the
 # requested style; visual hierarchy comes from size alone.
-SETTING_TITLE_FONT_PX = 22        # 主标题：设置 / 历史记录
-SETTING_NAV_FONT_PX = 20          # 左侧分类：外观 / 行为 / 日历订阅 / 关于
-SETTING_ROW_TITLE_FONT_PX = 19    # 设置项标题：皮肤 / 透明光泽 / 窗口颜色 …
-SETTING_TIP_FONT_PX = 18          # 感叹号悬浮说明气泡
-SETTING_CONTROL_FONT_PX = 17      # 下拉框 / 开关 / 按钮 / 颜色等控件
-SETTING_STATUS_FONT_PX = 16       # 副标题 / 状态 / 说明性文字
+SETTING_TITLE_FONT_PX = 30        # 主标题：设置 / 历史记录
+SETTING_NAV_FONT_PX = 25          # 左侧分类：外观 / 行为 / 日历订阅 / 关于
+SETTING_ROW_TITLE_FONT_PX = 24    # 设置项标题：皮肤 / 窗口颜色 / 窗口模式 …
+SETTING_TIP_FONT_PX = 22          # 感叹号悬浮说明气泡
+SETTING_CONTROL_FONT_PX = 21      # 下拉框 / 开关 / 按钮 / 颜色等控件
+SETTING_STATUS_FONT_PX = 20       # 副标题 / 状态 / 说明性文字
 POPUP_INPUT_FONT_PX = 19          # 添加备忘 / 编辑截止时间 弹窗输入框
+
+
+def scaled_dialog_size(
+    base_width: int,
+    base_height: int,
+    scale: float = 1.5,
+    available: QRect | None = None,
+) -> QSize:
+    """Return a generously scaled dialog size that still fits the current work area.
+
+    The 1.5x target is used whenever the screen allows it. On smaller displays the dialog is
+    capped to 98% of the available work area so its frameless close controls never land behind
+    the taskbar or outside the screen.
+    """
+    if available is None:
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else QRect(0, 0, 1920, 1080)
+    wanted_width = round(base_width * scale)
+    wanted_height = round(base_height * scale)
+    max_width = max(640, int(available.width() * 0.98))
+    max_height = max(600, int(available.height() * 0.98))
+    return QSize(min(wanted_width, max_width), min(wanted_height, max_height))
+
+
 def enlarge_control_font(widget: QWidget, px: int = SETTING_CONTROL_FONT_PX) -> None:
     # qfluentwidgets controls hardcode `font: 14px` in their own QSS, which beats setFont;
     # appending custom QSS via setCustomStyleSheet is the supported override path. The
@@ -132,6 +156,7 @@ def enlarge_control_font(widget: QWidget, px: int = SETTING_CONTROL_FONT_PX) -> 
     font = f"font: {px}px 'Times New Roman','Microsoft YaHei','Segoe UI Emoji';"
     qss = f"{name} {{ {font} }} {name} * {{ {font} }} {name} QLabel {{ {font} }}"
     setCustomStyleSheet(widget, qss, qss)
+    widget.setMinimumHeight(max(widget.minimumHeight(), round(px * 2.3)))
 
 
 def set_label_font(label: QWidget, px: int, weight: QFont.Weight = QFont.Normal) -> None:
@@ -160,12 +185,12 @@ class InfoToolTipFilter(ToolTipFilter):
 class FluentSettingRow(CardWidget):
     def __init__(self, title: str, content: str, control: QWidget, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(74)
+        self.setMinimumHeight(94)
         self.setObjectName("fluentSettingRow")
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(18, 12, 18, 12)
-        layout.setSpacing(18)
+        layout.setContentsMargins(24, 16, 24, 16)
+        layout.setSpacing(22)
 
         text_layout = QHBoxLayout()
         text_layout.setContentsMargins(0, 0, 0, 0)
@@ -176,8 +201,8 @@ class FluentSettingRow(CardWidget):
         text_layout.addWidget(title_label)
         if content:
             info = TransparentToolButton(FluentIcon.INFO, self)
-            info.setFixedSize(26, 26)
-            info.setIconSize(QSize(16, 16))
+            info.setFixedSize(32, 32)
+            info.setIconSize(QSize(20, 20))
             info.setCursor(Qt.WhatsThisCursor)
             info.setToolTip(content)
             info.installEventFilter(InfoToolTipFilter(info, showDelay=200, position=ToolTipPosition.TOP))

@@ -4,10 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Windows 11 desktop memo/todo widget rendered as a translucent "Liquid Glass" surface.
-It is a real-time GPU screen-capture widget: it continuously captures the desktop region
-behind itself and refracts it through D3D11 effects, with a Qt content layer (todo rows,
-buttons) floating on top. Windows-only (Win32 + D3D11); will not run or build on other platforms.
+A Windows 11 desktop memo/todo widget rendered as a translucent surface floating on the desktop.
+The window is a lightweight **DWM acrylic frost** (the default "磨砂玻璃" skin) or a static
+user-supplied **image background**, with a Qt content layer (todo rows, buttons) on top.
+Windows-only (Win32 + DWM); will not run or build on other platforms.
+
+> History: earlier versions also offered a real-time D3D11 "液态玻璃" (liquid glass) skin that
+> screen-captured the desktop behind the window and refracted it through GPU effects. That skin
+> was removed (it was buggy and heavy); the vendored `WindowsLiquidGlass` engine, the capture /
+> effect pipeline, and the `numpy` dependency are all gone. Don't reintroduce a screen-capture
+> render path.
 
 UI strings are Chinese. Code/identifiers are English.
 
@@ -17,6 +23,9 @@ UI strings are Chinese. Code/identifiers are English.
 # Run from source (preferred entry point — pythonw = no console window)
 python -m pip install -r .\LiquidMemoWidget\requirements.txt
 pythonw .\RunLiquidMemoWidget.pyw
+
+# Headless regression suite (Qt uses the offscreen platform in tests/conftest.py)
+py -3.13 -m pytest .\tests -q
 
 # Build a PyInstaller bundle into dist\LiquidMemoWidget\
 .\Build.ps1
@@ -32,8 +41,7 @@ third-party module imported there must also be added to `Build.ps1` as `--hidden
 (this shipped a launch crash once: `xml.etree` was missing). Smoke-test
 `dist\LiquidMemoWidget\LiquidMemoWidget.exe` after changing imports.
 
-There are **no automated tests and no linter configured**. `one_d3d_widget.py` has a manual
-`__main__` smoke-test entry that renders a standalone glass square. Releases are produced by
+The regression suite lives under `tests/`; there is no linter configured. Releases are produced by
 `.github/workflows/release.yml`, triggered by pushing a `v*` tag. **Before tagging a release:**
 bump `APP_VERSION` in `LiquidMemoWidget/version.py` and add a `## vX.Y.Z` section to
 `CHANGELOG.md` documenting the changes — the workflow extracts that section as the GitHub
@@ -53,95 +61,119 @@ without import cycles. Key files:
   `FramelessDragMixin`, `tray_icon`. Imports no app/window/engine code.
 - `settings_ui.py` — `SettingsWindow`.  `update_ui.py` — update dialogs + `UpdateManager`.
   `calendar_manager.py` — `CalendarManager` + sync tasks.
-- `app.py` — `MemoWindow` (the D3D surface), the memo content widgets/popups, `HistoryWindow`,
-  the skins, and `LiquidMemoApp` (lifecycle/orchestration); imports the four modules above.
+- `floating_launcher.py` — the painted 72px launcher plus `FloatingModeController`, pure panel-
+  placement helpers, and launcher deadline-status calculation.
+- `surprise_crypto.py` / `surprise_mode.py` — authenticated encrypted optional-content loading,
+  per-Windows-user key sealing, the opt-in themed mode and its daily pinned row/note UI. The
+  personalized payload is committed only as `surprise.enc`; never put its plaintext or passphrase
+  in source, tests, documentation, shell arguments, or CI variables.
+- `app.py` — `MemoWindow` (the translucent window), the memo content widgets/popups,
+  `HistoryWindow`, the `AcrylicSkin`/`ImageSkin` skins, and `LiquidMemoApp`
+  (lifecycle/orchestration); imports the four modules above.
 - `updater.py` — Qt-free update logic. New first-party modules ship via `--add-data` and are
   imported at runtime, so splitting `app.py` further needs **no `Build.ps1` change** (only new
   *third-party* imports need a `--hidden-import`).
 
 ### Two-layer rendering model
-`MemoWindow` (in `LiquidMemoWidget/app.py`) subclasses `OneGPUWidget` from the vendored
-`WindowsLiquidGlass` engine. The window itself is the D3D-rendered glass surface. **All
-interactive content lives in `self.container`** (a transparent child `QWidget` exposed as
-`MemoWindow.content`), never directly on the window — the D3D background cannot host
-transparent children otherwise.
+`MemoWindow` (in `LiquidMemoWidget/app.py`) is a plain translucent `QWidget`
+(`WA_TranslucentBackground`, frameless `Qt.Tool`, topmost). The window's surface is supplied
+by the active skin, not by Qt painting:
+- **`AcrylicSkin` (default):** `WindowsWindowEffect.setAcrylicEffect` applies a DWM acrylic frost
+  to the hwnd; `set_rounded_corners` rounds it. No screen capture, no GPU effects, no per-frame loop.
+- **`ImageSkin`:** an `_ImageBackground` child paints a cover-scaled static image below the content.
 
-**Critical invariant:** the content layer must be excluded from screen capture via
-`set_window_exclude_from_capture` (`SetWindowDisplayAffinity` / `WDA_EXCLUDEFROMCAPTURE`).
-Otherwise the next captured frame includes the widget's own text and refracts it into noise.
-`protect_content_layer()` enforces this and is re-called aggressively (on show, move, settings
-apply, with staggered `QTimer.singleShot` retries) because Windows resets the affinity on
-various window-state changes.
+**All interactive content lives in `self.container`** (a transparent child `QWidget` exposed as
+`MemoWindow.content`), created directly in `__init__` and kept sized to the window. Both skins
+are static surfaces (`geometry_scale = 1.0`), so content fills the window minus a small corner
+margin; `_resize_for_content` solves the window height from the content and calls `setFixedSize`.
 
-### One capture system, validated before present
-`MemoWindow._on_frame` **overrides** the stock `OneGPUWidget._on_frame` loop: every captured
-frame is read back (`copy_resource_to_numpy`) and checked by `_frame_looks_blank` before
-effects render and present. This exists because Windows desktop duplication intermittently
-delivers all-black frames for this `WDA_EXCLUDEFROMCAPTURE` window's region — presenting
-them unchecked makes the glass flash black↔transparent (a real shipped bug, twice). Blank
-frames are dropped (and their pool resource freed) while the last good output stays on
-screen. The loop runs at `REST_FPS` (20) idle / `MOVE_FPS` (30) while dragging — the glass
-is a static transform of the background, so 60fps is never needed.
+**Capture-exclusion invariant:** `protect_content_layer()` raises the content layer and calls
+`set_window_exclude_from_capture` (`SetWindowDisplayAffinity` / `WDA_EXCLUDEFROMCAPTURE`, now a
+plain helper in `window_layer.py`) so screenshots / screen recordings of the desktop don't grab
+the widget's own text. It's re-called on show/move/settings-apply with staggered
+`QTimer.singleShot` retries because Windows resets the affinity on various window-state changes.
 
-The adaptive-contrast sampler (`_sample_background`) reuses `_latest_frame` cached by that
-loop and analyzes it with numpy. Do NOT add a separate GDI/`grabWindow` screen capture for
-sampling: periodic GDI captures of an excluded window's region force DWM capture
-recompositions that feed black frames into the duplication stream (the original flicker
-trigger).
-
-### Capture pipeline goes stale and must be reset
-DWM display capture becomes invalid after idle / display changes. `reset_capture_pipeline()`
-tears down and re-initializes the capture source; `refresh_capture_after_idle()` decides
-between a full reset (>45s idle) and a cheap position resync. When touching move/show/settings
-flows, preserve these reset calls — dropping them produces a frozen or blank glass surface.
+### Text color is deterministic (no sampling)
+There is no live desktop sampling anymore (that was glass-only). `_normal_text_color` picks text
+deterministically: `AcrylicSkin` chooses a soft dark/light by the **frost tint's** luminance
+(`windowTint`); `ImageSkin` chooses by the **image's mean luminance**, but honors a manual color
+when `fontColorMode == "manual"`. `text_needs_halo()` is always `False` (flat surfaces). When
+editing text-color logic, do not add a screen-capture/GDI sampler back in.
 
 ### Native window behavior (`window_layer.py` + `MemoWindow.nativeEvent`)
-The widget runs with `qt_move=False` and handles Win32 messages directly:
+The widget handles Win32 messages directly (no Qt-driven move):
 - `WM_NCHITTEST` → `HTCAPTION` over the drag handle (native move), `HTCLIENT` over interactive
   controls (checkboxes, buttons), and `HTTRANSPARENT` everywhere else so clicks pass through to
   the desktop. This click-through is the `alwaysVisibleClickThrough` layer mode (the only
   supported `layerMode` — `state_store.py` force-normalizes any other value).
-- `WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE` bracket a native move; during a move the frame loop drops
-  to 30 fps and auto-contrast is paused, then restored on exit.
+- `WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE` bracket a native move (`_begin_window_move`/`_end_window_move`,
+  which just track state, persist position, and re-protect the content layer — the frost / image
+  follows the window natively, so there's nothing to spin up).
+- Collapsed mode also returns `HTBOTTOM` over the bottom resize strip. Todo rows return
+  `HTCLIENT` for drag-reordering; calendar rows remain read-only/click-through outside checkbox.
 - `window_layer.py` applies tool-window ex-style (no taskbar entry), detaches from any parent,
   and pins topmost.
 
-### Adaptive text contrast (`update_auto_contrast` + `liquid_effects.py`)
-When `fontColorMode != "manual"`, a 220ms timer samples the desktop behind the window,
-computes a luminance/edge "complexity" score, and picks text color: dark/light for calm
-backgrounds, or one of `HIGH_VISIBILITY_COLORS` (neon) when the background is "extremely busy"
-(e.g. terminal/text-heavy). `autoEnhanced` mode additionally applies a soft halo
-(`QGraphicsDropShadowEffect`) behind text. The sampled background is blended with the window
-tint using `color_overlay_strength(glassOpacity)` to estimate the *effective* color seen
-through the glass.
-
-### Effect parameters
-`liquid_effects.build_effect_params` is the single place that maps user settings
-(`windowTint`, `glassOpacity`, `liquidStrength`) onto the engine's `EFFECTS_PARAMS` dict
-(flow, chromatic aberration, highlight, anti-aliasing, color overlay). Effects are only
-re-uploaded when the `_effect_signature` tuple changes, to avoid per-frame churn.
+### Settings → skin dispatch
+`apply_settings` resolves `settings.skin` via `_make_skin` (an `"image:<id>"` with a missing file
+falls back to `AcrylicSkin`) and dispatches to `_apply_acrylic_mode` / `_apply_image_mode`, which
+swap the DWM frost vs. the image layer. `windowTint` tints the acrylic frost; the removed
+`glassOpacity` / `liquidStrength` settings were glass-only and no longer exist.
 
 ### State & persistence (`state_store.py`)
 Dataclasses `AppState / Settings / WindowState / TodoItem` serialize to
-`%APPDATA%\Roaming\DesktopMemoWidget\liquid-state.json`. Writes are atomic (temp file +
+`%APPDATA%\Roaming\DesktopMemo_Pro\liquid-state.json`. Writes are atomic (temp file +
 `replace`); a corrupt file is backed up as `liquid-state.bad-<timestamp>.json` and a fresh
 state is returned. Saves are normally debounced through `LiquidMemoApp.save_later()` (350ms);
 use `save()` directly only when immediate persistence is required. Completed todos move to
 `history` (archive) or stay dimmed in-place depending on `completeBehavior`.
+`Settings.windowMode` is one of `normal`, `edgeHide`, or `floatingLauncher`; v4
+`edgeAutoHide` state migrates into that enum. The launcher position is stored independently from
+the memo position and clamped to the live monitor layout when shown.
+State v6 adds the optional encrypted-mode flags, a DPAPI-protected derived key, and date/index
+markers for its once-per-day completion/note behavior. Disabling it clears those fields and
+restores the window mode that was active before activation.
+
+### Encrypted optional payload
+`tools/encrypt_surprise.py` reads a gitignored private JSON and prompts twice for the passphrase;
+it writes `LiquidMemoWidget/surprise.enc` using scrypt plus AES-256-GCM. Only that ciphertext is
+distributed. At first activation the derived key is sealed with Windows DPAPI and stored in the
+normal app state, so the same Windows user does not have to type the passphrase again. To rebuild
+the payload locally:
+
+```powershell
+py -3.13 .\tools\encrypt_surprise.py .\private\surprise.json
+```
+
+The plaintext input is intentionally ignored by Git and should be deleted after encryption.
 
 ### App lifecycle (`LiquidMemoApp`)
 Owns the `QApplication`, the `MemoWindow`, the `SettingsWindow`/`HistoryWindow` dialogs, and
 the system tray (`QSystemTrayIcon`). `setQuitOnLastWindowClosed(False)` — closing the window
 hides it; exit happens only via the tray menu. `startup.py` toggles a `HKCU\...\Run` registry
 entry for launch-at-login.
+`FloatingModeController` owns the separate launcher top-level window and decides at startup and
+runtime whether to show the memo, edge-dock it, or expose only the launcher. In launcher mode the
+memo is an anchored popover and must not overwrite the saved normal-window position.
 
-## Vendored dependency: `WindowsLiquidGlass/`
+### Auto-update (`updater.py` + `update_ui.py`)
+In-app update over GitHub Releases: `updater.py` is Qt-free network/process logic;
+`update_ui.py` owns the dialogs and the `UpdateManager` orchestration. Flow: fetch latest release
+(GitHub API, falling back to the rate-limit-free `releases.atom` feed) → if newer, prompt with
+release notes → download the `-Setup-*.exe` to `%TEMP%` → **verify SHA256** → spawn a detached
+`--apply-update` helper (this same exe) that waits for the app to exit, runs the Inno installer
+silently, and relaunches. `pendingUpdateVersion` persists across the restart so a failed install
+surfaces a notice next launch.
 
-This is an adapted copy of [ai12989757/WindowsLiquidGlass](https://github.com/ai12989757/WindowsLiquidGlass)
-providing the D3D screen-capture, rounded-rect SDF, GPU effect renderer, and Qt glass widget.
-It ships **prebuilt `.dll` and compiled shader (`.cso`) binaries** under each module's `bin/`.
-The C++/HLSL sources are built via the per-module `build.bat` / `bulider.bat` scripts (require
-a Windows D3D toolchain) — they are **not** part of the normal Python build and you rarely need
-to rebuild them. Treat this directory as a third-party boundary; the integration surface used
-by the app is just `OneGPUWidget`, `EffectType`, `EFFECTS_PARAMS`, and
-`set_window_exclude_from_capture` imported in `app.py`. See `THIRD_PARTY_NOTICES.md`.
+**Release-asset contract** (produced by `release.yml` / `Package.ps1`, consumed by `updater.py`):
+- `LiquidMemoWidget-Setup-vX.Y.Z.exe` + `.sha256` sidecar (`<hash>  <name>`, sha256sum layout)
+- `LiquidMemoWidget-Portable-vX.Y.Z.zip` + `.sha256` sidecar
+- The installer is verified against its sidecar before the silent install (mismatch aborts;
+  a release with no sidecar — older versions — skips verification rather than fail-closed).
+- The portable zip carries a `portable.flag` marker (never in the installer). `is_portable_build()`
+  detects it: a portable copy must NOT silent-install over itself, so its update button just opens
+  the release page.
+
+The silent startup check is throttled (`Settings.lastUpdateCheckAt`, every 12h), gated by
+`Settings.autoCheckUpdates` (a 关于-section toggle), and won't re-prompt for a version the user
+dismissed (`Settings.lastDismissedUpdateVersion`); a manual "检查更新" bypasses all of these.

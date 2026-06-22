@@ -3,6 +3,7 @@ changelog, and the manager that runs the startup/manual checks. Network/install
 logic lives in updater.py; the app is reached through `self.app`."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,6 +25,7 @@ from ui_common import (
     FONT_STACK_QSS,
     add_soft_shadow,
     enlarge_control_font,
+    scaled_dialog_size,
     set_label_font,
 )
 from version import APP_VERSION, GITHUB_URL
@@ -34,11 +36,11 @@ if TYPE_CHECKING:
 
 # Update dialogs are glanced at and matter (a release prompt / the post-update notes), so the
 # type is deliberately large and clearly readable — bigger than the settings rows.
-UPDATE_TITLE_PX = 28
-UPDATE_SUBTITLE_PX = 19
-UPDATE_NOTES_PX = 19
-UPDATE_STATUS_PX = 17
-UPDATE_BUTTON_PX = 19
+UPDATE_TITLE_PX = 36
+UPDATE_SUBTITLE_PX = 24
+UPDATE_NOTES_PX = 23
+UPDATE_STATUS_PX = 21
+UPDATE_BUTTON_PX = 23
 
 
 class _ReleaseCardDialog(QDialog):
@@ -47,7 +49,9 @@ class _ReleaseCardDialog(QDialog):
     def __init__(self, width: int, height: int) -> None:
         super().__init__(None, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(width, height)
+        size = scaled_dialog_size(width, height)
+        width, height = size.width(), size.height()
+        self.setFixedSize(size)
         self.frame = QFrame(self)
         self.frame.setObjectName("fluentPanel")
         self.frame.setGeometry(0, 0, width, height)
@@ -58,18 +62,25 @@ class _ReleaseCardDialog(QDialog):
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 rgb(252, 253, 255), stop:1 rgb(240, 244, 250));
                 border: 1px solid rgba(255,255,255,210);
-                border-radius: 22px;
+                border-radius: 28px;
             }}
             """
         )
         add_soft_shadow(self.frame, blur=34, y=12, alpha=80)
         self.body = QVBoxLayout(self.frame)
-        self.body.setContentsMargins(34, 30, 34, 30)
-        self.body.setSpacing(18)
+        self.body.setContentsMargins(46, 40, 46, 40)
+        self.body.setSpacing(24)
+
+    def apply_surprise_theme(self, active: bool) -> None:
+        top = "#FFF8FB" if active else "rgb(252,253,255)"
+        bottom = "#FFE3EC" if active else "rgb(240,244,250)"
+        self.frame.setStyleSheet(
+            f"QFrame#fluentPanel {{ {FONT_STACK_QSS} background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 {top},stop:1 {bottom}); border: 1px solid rgba(255,255,255,210); border-radius: 28px; }}"
+        )
 
     def add_header(self, title: str, subtitle: str) -> None:
         titles = QVBoxLayout()
-        titles.setSpacing(8)
+        titles.setSpacing(10)
         title_label = TitleLabel(title)
         set_label_font(title_label, UPDATE_TITLE_PX)
         subtitle_label = BodyLabel(subtitle)
@@ -88,8 +99,8 @@ class _ReleaseCardDialog(QDialog):
         scroll.setStyleSheet(
             """
             QScrollArea { background: rgba(255,255,255,140); border: 1px solid rgba(17,24,32,18); border-radius: 12px; }
-            QScrollBar:vertical { width: 6px; background: transparent; margin: 2px; }
-            QScrollBar::handle:vertical { background: rgba(17,24,32,60); border-radius: 3px; min-height: 32px; }
+            QScrollBar:vertical { width: 9px; background: transparent; margin: 2px; }
+            QScrollBar::handle:vertical { background: rgba(17,24,32,60); border-radius: 4px; min-height: 40px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             """
         )
@@ -103,7 +114,7 @@ class _ReleaseCardDialog(QDialog):
         notes.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         notes.setStyleSheet(
             f"{FONT_STACK_QSS} color: rgb(24,32,40); font-size: {UPDATE_NOTES_PX}px;"
-            " background: transparent; padding: 18px;"
+            " background: transparent; padding: 24px;"
         )
         scroll.setWidget(notes)
         self.body.addWidget(scroll, 1)
@@ -136,6 +147,7 @@ class UpdateDialog(_ReleaseCardDialog):
     def __init__(self, app: "LiquidMemoApp", release: updater.ReleaseInfo) -> None:
         super().__init__(680, 740)
         self.app = app
+        self.apply_surprise_theme(getattr(getattr(app, "surprise", None), "active", False))
         self.release = release
         self._downloading = False
         self._signals: _DownloadSignals | None = None
@@ -155,26 +167,27 @@ class UpdateDialog(_ReleaseCardDialog):
         self.body.addWidget(self.status)
 
         buttons = QHBoxLayout()
-        buttons.setSpacing(12)
+        buttons.setSpacing(16)
         buttons.addStretch()
         self.later = PushButton("稍后再说", self.frame)
-        self.later.setMinimumWidth(130)
-        self.later.setFixedHeight(42)
+        self.later.setMinimumWidth(180)
+        self.later.setFixedHeight(54)
         enlarge_control_font(self.later, UPDATE_BUTTON_PX)
         self.later.clicked.connect(self.close)
         buttons.addWidget(self.later)
         self.install = PrimaryPushButton("立即更新", self.frame, FluentIcon.UPDATE)
-        self.install.setMinimumWidth(150)
-        self.install.setFixedHeight(42)
+        self.install.setMinimumWidth(210)
+        self.install.setFixedHeight(54)
         enlarge_control_font(self.install, UPDATE_BUTTON_PX)
         self.install.clicked.connect(self._start)
         buttons.addWidget(self.install)
         self.body.addLayout(buttons)
 
     def _start(self) -> None:
-        # Outside a packaged build (or with no installer asset) fall back to the
-        # release page instead of attempting a silent install.
-        if not updater.is_frozen() or not self.release.installer_url:
+        # Fall back to the release page instead of a silent install when:
+        # not a packaged build, no installer asset, or this is the portable build (which must
+        # not run the Inno installer over itself — it may sit in a read-only/arbitrary folder).
+        if not updater.is_frozen() or updater.is_portable_build() or not self.release.installer_url:
             QDesktopServices.openUrl(QUrl(self.release.html_url))
             return
         self._downloading = True
@@ -218,20 +231,25 @@ class UpdateDialog(_ReleaseCardDialog):
         if self._downloading:
             event.ignore()
             return
+        # Dismissing the prompt ("稍后再说" or the window close) remembers this version so a
+        # silent startup check won't re-prompt for it on later runs (a manual check still will).
+        self.app.state.settings.lastDismissedUpdateVersion = self.release.version
+        self.app.save_later()
         super().closeEvent(event)
 
 
 class ChangelogDialog(_ReleaseCardDialog):
-    def __init__(self, notes: str, html: bool = False) -> None:
+    def __init__(self, notes: str, html: bool = False, app=None) -> None:
         super().__init__(660, 680)
+        self.apply_surprise_theme(getattr(getattr(app, "surprise", None), "active", False))
         self.setWindowTitle("更新日志")
         self.add_header("更新完成 🎉", f"桌面备忘已更新到 v{APP_VERSION}，本次更新内容：")
         self.add_notes(notes, html)
         buttons = QHBoxLayout()
         buttons.addStretch()
         ok = PrimaryPushButton("知道了", self.frame, FluentIcon.ACCEPT)
-        ok.setMinimumWidth(150)
-        ok.setFixedHeight(42)
+        ok.setMinimumWidth(200)
+        ok.setFixedHeight(54)
         enlarge_control_font(ok, UPDATE_BUTTON_PX)
         ok.clicked.connect(self.close)
         buttons.addWidget(ok)
@@ -262,6 +280,11 @@ class _UpdateCheckTask(QRunnable):
 class UpdateManager:
     """Owns update flows: post-update changelog, startup silent check, manual check."""
 
+    # The silent startup check is throttled to this interval (keyed off lastUpdateCheckAt) so
+    # we don't hit the GitHub API on every launch — anonymous REST is 60 req/h per IP, easily
+    # shared behind NAT. A manual "检查更新" always bypasses the throttle.
+    _SILENT_CHECK_INTERVAL = timedelta(hours=12)
+
     def __init__(self, app: "LiquidMemoApp") -> None:
         self.app = app
         self._checking = False
@@ -285,7 +308,20 @@ class UpdateManager:
                         f"更新说明获取失败，可前往 [GitHub 发布页]({GITHUB_URL}/releases) 查看。"
                     ),
                 )
-        QTimer.singleShot(8000, lambda: self.check(silent=True))
+        if settings.autoCheckUpdates and self._silent_check_due(settings):
+            QTimer.singleShot(8000, lambda: self.check(silent=True))
+
+    def _silent_check_due(self, settings) -> bool:
+        stamp = settings.lastUpdateCheckAt
+        if not stamp:
+            return True
+        try:
+            last = datetime.fromisoformat(stamp)
+        except ValueError:
+            return True
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - last >= self._SILENT_CHECK_INTERVAL
 
     def _check_failed_update(self, settings) -> None:
         """If an install was attempted last run but the version did not advance, the
@@ -311,6 +347,9 @@ class UpdateManager:
         if self._checking:
             return
         self._checking = True
+        # Stamp the check time (both silent and manual) so the throttle clock is reset.
+        self.app.state.settings.lastUpdateCheckAt = datetime.now(timezone.utc).isoformat()
+        self.app.save_later()
         self.app.settings_window.set_update_status("正在检查更新…")
         self._fetch(
             tag=None,
@@ -329,9 +368,11 @@ class UpdateManager:
         self._checking = False
         if updater.is_newer(release.version):
             self.app.settings_window.set_update_status(f"发现新版本 {release.tag}")
-            # A silent (startup) check only prompts once per version per run;
-            # a manual check always re-opens the dialog.
-            if not silent or release.tag != self._prompted_tag:
+            # A manual check always re-opens the dialog. A silent (startup) check prompts at
+            # most once per version per run, and never for a version the user already dismissed
+            # ("稍后再说") on a previous run.
+            dismissed = self.app.state.settings.lastDismissedUpdateVersion == release.version
+            if not silent or (release.tag != self._prompted_tag and not dismissed):
                 self._prompted_tag = release.tag
                 self._show_dialog(UpdateDialog(self.app, release))
         else:
@@ -342,7 +383,7 @@ class UpdateManager:
         self.app.settings_window.set_update_status("" if silent else f"检查更新失败：{message}")
 
     def _show_changelog(self, notes: str, html: bool = False) -> None:
-        self._show_dialog(ChangelogDialog(notes, html))
+        self._show_dialog(ChangelogDialog(notes, html, self.app))
 
     def _show_dialog(self, dialog: QDialog) -> None:
         self._dialog = dialog

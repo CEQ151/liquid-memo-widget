@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap, QRegion
-from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFrame, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import BodyLabel, FluentIcon, LineEdit, PrimaryPushButton, PushButton, TitleLabel
 
 from ui_common import (
@@ -230,17 +230,7 @@ class CropDialog(QDialog):
         self.frame = QFrame(self)
         self.frame.setObjectName("fluentPanel")
         self.frame.setGeometry(0, 0, width, height)
-        self.frame.setStyleSheet(
-            f"""
-            QFrame#fluentPanel {{
-                {FONT_STACK_QSS}
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgb(252, 253, 255), stop:1 rgb(240, 244, 250));
-                border: 1px solid rgba(255,255,255,210);
-                border-radius: 22px;
-            }}
-            """
-        )
+        self.apply_surprise_theme(bool(QApplication.instance().property("surpriseMode")))
         add_soft_shadow(self.frame, blur=34, y=12, alpha=80)
 
         body = QVBoxLayout(self.frame)
@@ -299,6 +289,22 @@ class CropDialog(QDialog):
         body.addLayout(buttons)
 
         self.skin_name = ""
+
+    def apply_surprise_theme(self, active: bool) -> None:
+        top = "rgb(255,248,251)" if active else "rgb(252,253,255)"
+        bottom = "rgb(255,227,236)" if active else "rgb(240,244,250)"
+        border = "rgba(255,198,218,230)" if active else "rgba(255,255,255,210)"
+        self.frame.setStyleSheet(
+            f"""
+            QFrame#fluentPanel {{
+                {FONT_STACK_QSS}
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {top}, stop:1 {bottom});
+                border: 1px solid {border};
+                border-radius: 22px;
+            }}
+            """
+        )
 
     def _on_save(self) -> None:
         name = self.name_input.text().strip()
