@@ -49,7 +49,7 @@ Source: "..\dist\LiquidMemoWidget\*"; DestDir: "{app}"; Flags: ignoreversion rec
 ; NOT create or modify it at install time (ValueType: none = leave it alone). We only delete it
 ; on uninstall so the HKCU\...\Run "LiquidMemoWidget" value isn't left orphaned, pointing at a
 ; now-removed exe.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "LiquidMemoWidget"; Flags: uninstalldeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "LiquidMemoWidget"; Flags: uninsdeletevalue
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
