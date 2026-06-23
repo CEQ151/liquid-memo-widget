@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -56,7 +56,7 @@ from qfluentwidgets import (
 )
 
 from skin_editor import load_skin_pixmap, mean_luminance as image_mean_luminance
-from state_store import CalendarEvent, Settings, StateStore, TodoItem, parse_ddl, utc_now
+from state_store import CalendarEvent, Settings, StateStore, TodoItem, deadline_alert, parse_ddl, utc_now
 from wheel_hook import GlobalWheelHook
 from window_layer import (
     HTBOTTOM,
@@ -442,15 +442,7 @@ class TodoRow(QFrame):
         # cells whose text we cannot parse into a date never get the alert colors.
         if self.todo.done or not self.todo.ddl.strip():
             return "none"
-        deadline = parse_ddl(self.todo.ddl)
-        if deadline is None:
-            return "normal"
-        now = datetime.now()
-        if deadline < now:
-            return "overdue"
-        if deadline - now <= timedelta(days=self.settings.nearHighlightDays):
-            return "near"
-        return "normal"
+        return deadline_alert(self.todo.ddl, self.settings.nearHighlightDays)
 
     def apply_text_style(self, color: QColor, protect: bool) -> None:
         # Re-applying an identical style (and especially swapping in a brand-new
@@ -635,16 +627,7 @@ class CalendarRow(QFrame):
     def _event_status(self) -> str:
         if self.done:
             return "none"
-        start = parse_ddl(self.cal_event.start)
-        if start is None:
-            return "normal"
-        now = datetime.now()
-        if start < now:
-            return "overdue"
-        near = timedelta(days=self.parent_window.app.state.settings.nearHighlightDays)
-        if start - now <= near:
-            return "near"
-        return "normal"
+        return deadline_alert(self.cal_event.start, self.parent_window.app.state.settings.nearHighlightDays)
 
     def apply_text_style(self, color: QColor, protect: bool) -> None:
         status = self._event_status()
@@ -972,6 +955,10 @@ class AcrylicSkin:
     kind = "acrylic"
     geometry_scale = 1.0
     corner_margin = 14
+    # None -> use settings.windowTint for the frost and pick text deterministically by luminance.
+    # SurpriseSkin overrides these so the themed look isn't special-cased across the dispatch.
+    acrylic_tint: "str | None" = None
+    text_override: "str | None" = None
 
     def vertical_padding(self, height: int) -> int:
         return 0
@@ -987,6 +974,17 @@ ACRYLIC_TINT_ALPHA = 0xB3  # ~0.70
 # near-black on light frost, a soft near-white on dark frost (not pure #000/#FFF — calmer).
 ACRYLIC_TEXT_DARK = "#1B2127"
 ACRYLIC_TEXT_LIGHT = "#E8ECEF"
+
+
+class SurpriseSkin(AcrylicSkin):
+    """Themed frost for the opt-in surprise mode: a fixed pink tint and a fixed soft text color.
+
+    Subclassing AcrylicSkin keeps ``kind == "acrylic"`` so it flows through the normal acrylic
+    dispatch; the themed look lives here in one place instead of being special-cased across
+    _make_skin / _apply_acrylic_effect / _normal_text_color."""
+
+    acrylic_tint = "#FFDDE8"
+    text_override = SURPRISE_TEXT
 
 
 class ImageSkin:
@@ -1246,6 +1244,7 @@ class MemoWindow(QWidget):
                     return True, HTCLIENT
                 if (
                     not self._expanded
+                    and self.app.state.settings.windowMode != "floatingLauncher"
                     and 0 <= local.x() < self.width()
                     and self.height() - RESIZE_MARGIN <= local.y() <= self.height()
                 ):
@@ -1520,7 +1519,7 @@ class MemoWindow(QWidget):
 
     def _make_skin(self, skin_name: str):
         if getattr(self.app, "surprise", None) is not None and self.app.surprise.active:
-            return AcrylicSkin()
+            return SurpriseSkin()
         if skin_name.startswith("image:"):
             skin_id = skin_name[len("image:"):]
             custom = next((s for s in self.app.state.settings.customSkins if s.id == skin_id), None)
@@ -1589,7 +1588,7 @@ class MemoWindow(QWidget):
 
     def _apply_acrylic_effect(self) -> None:
         settings = self.app.state.settings
-        tint = qcolor("#FFDDE8" if self.app.surprise.active else settings.windowTint, "#F2F4F7")
+        tint = qcolor(getattr(self.skin, "acrylic_tint", None) or settings.windowTint, "#F2F4F7")
         gradient = f"{tint.red():02X}{tint.green():02X}{tint.blue():02X}{ACRYLIC_TINT_ALPHA:02X}"
         if self._acrylic_applied and gradient == self._acrylic_signature:
             return  # avoid re-issuing the composition attribute on every slider tick (flicker)
@@ -1652,8 +1651,16 @@ class MemoWindow(QWidget):
         target_index = sum(cursor_y >= candidate.geometry().center().y() for candidate in others)
         if target_index == rows.index(row):
             return
+        # target_index counts TodoRows only, but insertWidget is layout-absolute. Offset by any
+        # leading non-TodoRow widgets (the pinned surprise row) so a drop lands at the visual slot
+        # and a todo can never be inserted above the pinned row.
+        leading = 0
+        for index in range(self.list_layout.count()):
+            if isinstance(self.list_layout.itemAt(index).widget(), TodoRow):
+                break
+            leading += 1
         self.list_layout.removeWidget(row)
-        self.list_layout.insertWidget(target_index, row)
+        self.list_layout.insertWidget(target_index + leading, row)
         self.list_layout.activate()
         row.raise_()
 
@@ -1770,8 +1777,9 @@ class MemoWindow(QWidget):
 
     def _normal_text_color(self) -> QColor:
         settings = self.app.state.settings
-        if self.app.surprise.active:
-            return qcolor(SURPRISE_TEXT)
+        override = getattr(self.skin, "text_override", None)
+        if override is not None:
+            return qcolor(override)
         if settings.skin.startswith("image:"):
             # Image surfaces honor a manual color choice; otherwise pick by image luminance.
             if settings.fontColorMode == "manual":

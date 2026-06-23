@@ -26,6 +26,8 @@ from version import APP_VERSION, GITHUB_OWNER, GITHUB_REPO, GITHUB_URL
 
 API_BASE = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
 _TIMEOUT = 15
+# A real Setup installer is tens of MB; anything under this is a truncated/failed download.
+_MIN_INSTALLER_BYTES = 1_000_000
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
 UPDATE_HELPER_FLAG = "--apply-update"
@@ -172,41 +174,56 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _parse_expected_sha256(text: str) -> str:
+def _parse_expected_sha256(text: str, filename: str | None = None) -> str:
     """Pull the hex digest out of a `.sha256` sidecar. Accepts the `sha256sum` layout
-    (`<hash>  <filename>`) or a bare hash; returns it lowercased, or "" if unparseable."""
+    (`<hash>  <filename>`) or a bare hash; returns it lowercased, or "" if unparseable.
+
+    When `filename` is given and the sidecar lists names, prefer the line whose name matches the
+    installer (so a cross-wired sidecar can't authorize a hash for a different asset); fall back to
+    the first bare/lone hash to keep older name-less sidecars working."""
+    fallback = ""
     for line in (text or "").splitlines():
-        token = line.strip().split()[0] if line.strip() else ""
-        if re.fullmatch(r"[0-9a-fA-F]{64}", token):
-            return token.lower()
-    return ""
+        parts = line.strip().split()
+        if not parts or not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            continue
+        digest = parts[0].lower()
+        name = parts[1].lstrip("*") if len(parts) > 1 else ""  # "*" = sha256sum binary marker
+        if filename and name and os.path.basename(name) == filename:
+            return digest
+        if not fallback:
+            fallback = digest
+    return fallback
 
 
-def verify_installer_checksum(path: Path, release: ReleaseInfo) -> None:
+def verify_installer_checksum(path: Path, release: ReleaseInfo) -> bool:
     """Verify the downloaded installer against the release's `.sha256` sidecar.
 
-    A *fetched* hash that does not match aborts the update (corruption / tampering). But when
+    Returns True when a trusted hash was fetched and matched, False when verification was skipped
+    (no usable sidecar). A *fetched* hash that does not match raises (corruption / tampering). When
     the sidecar can't be obtained — no `checksum_url`, or the fetch fails (older releases have
     no sidecar; the atom fallback only reconstructs the URL by convention) — verification is
     skipped: we have no trusted hash to compare against, and failing closed there would break
     updates to/from those versions. (Strong provenance is the job of code signing, not this.)"""
     if not release.checksum_url:
         _log(f"no checksum sidecar for {release.installer_name}; skipping verification")
-        return
+        return False
     try:
         request = urllib.request.Request(
             release.checksum_url, headers={"User-Agent": f"{GITHUB_REPO}-updater"}
         )
         with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            expected = _parse_expected_sha256(response.read().decode("utf-8", "replace"))
+            expected = _parse_expected_sha256(
+                response.read().decode("utf-8", "replace"), release.installer_name
+            )
     except Exception as exc:
         _log(f"checksum fetch failed for {release.installer_name}: {exc!r}; skipping verification")
-        return
+        return False
     if not expected:
         raise RuntimeError("无法解析安装包校验文件")
     if sha256_file(path) != expected:
         raise RuntimeError("安装包校验失败（SHA256 不匹配），已中止更新")
     _log(f"checksum verified for {release.installer_name}")
+    return True
 
 
 def download_installer(release: ReleaseInfo,
@@ -233,11 +250,18 @@ def download_installer(release: ReleaseInfo,
     if total and received < total:
         raise RuntimeError("下载不完整，请重试")
     try:
-        verify_installer_checksum(dest, release)
+        verified = verify_installer_checksum(dest, release)
     except Exception:
         # Never leave an unverified / corrupt installer behind for a later run to pick up.
         dest.unlink(missing_ok=True)
         raise
+    # When the server gave no length (atom fallback, no Content-Length) a premature connection
+    # close looks like a clean EOF, and if there was also no checksum to verify against, a
+    # truncated installer would otherwise pass. Reject a file far too small to be a real installer
+    # as a last-resort completeness guard.
+    if not total and not verified and received < _MIN_INSTALLER_BYTES:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError("下载不完整，请重试")
     return dest
 
 
@@ -314,41 +338,26 @@ def install_and_restart(installer: Path) -> None:
     _log(f"update helper pid {helper.pid} started for {Path(installer).name}; requesting app exit")
 
 
-def _process_image_path(pid: int) -> str | None:
-    """Return the executable path for `pid`, or None if it is already gone/unqueryable."""
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+def _image_path_from_handle(handle) -> str | None:
+    """Query a process's executable path from an already-open handle (None if unavailable)."""
     kernel32 = ctypes.windll.kernel32
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
+    size = wintypes.DWORD(32768)
+    buffer = ctypes.create_unicode_buffer(size.value)
+    query = kernel32.QueryFullProcessImageNameW
+    query.restype = wintypes.BOOL
+    query.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    if not query(handle, 0, buffer, ctypes.byref(size)):
         return None
-    try:
-        size = wintypes.DWORD(32768)
-        buffer = ctypes.create_unicode_buffer(size.value)
-        query = kernel32.QueryFullProcessImageNameW
-        query.restype = wintypes.BOOL
-        query.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
-        if not query(handle, 0, buffer, ctypes.byref(size)):
-            return None
-        return buffer.value
-    finally:
-        kernel32.CloseHandle(handle)
+    return buffer.value
 
 
 def _terminate_pid(pid: int, expected_exe: str, timeout: float = FORCED_EXIT_TIMEOUT_SECONDS) -> bool:
-    """Terminate a stuck old app only after confirming its image is the expected executable."""
-    actual_exe = _process_image_path(pid)
-    if actual_exe is None:
-        return _wait_for_pid_exit(pid, 0)
-    actual = os.path.normcase(os.path.abspath(actual_exe))
-    expected = os.path.normcase(os.path.abspath(expected_exe))
-    if actual != expected:
-        _log(f"refusing to terminate pid {pid}: image mismatch ({actual_exe!r})")
-        return False
+    """Terminate a stuck old app only after confirming its image is the expected executable.
 
+    The image-path check and the kill share ONE handle (opened with query + terminate access), so a
+    PID reused between the two steps can't redirect the terminate at an unrelated process: the open
+    handle keeps referring to the original process object even after that process exits."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     PROCESS_TERMINATE = 0x0001
     SYNCHRONIZE = 0x00100000
     kernel32 = ctypes.windll.kernel32
@@ -360,10 +369,20 @@ def _terminate_pid(pid: int, expected_exe: str, timeout: float = FORCED_EXIT_TIM
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.CloseHandle.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, False, pid
+    )
     if not handle:
         return _wait_for_pid_exit(pid, 0)
     try:
+        actual_exe = _image_path_from_handle(handle)
+        if actual_exe is None:
+            return _wait_for_pid_exit(pid, 0)
+        actual = os.path.normcase(os.path.abspath(actual_exe))
+        expected = os.path.normcase(os.path.abspath(expected_exe))
+        if actual != expected:
+            _log(f"refusing to terminate pid {pid}: image mismatch ({actual_exe!r})")
+            return False
         if not kernel32.TerminateProcess(handle, 0):
             return False
         return kernel32.WaitForSingleObject(handle, int(timeout * 1000)) == 0

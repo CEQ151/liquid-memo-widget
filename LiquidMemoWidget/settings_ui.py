@@ -859,7 +859,11 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         settings.fontColorMode = str(self.font_mode.currentData())
         settings.completeBehavior = str(self.complete.currentData())
         settings.layerMode = "alwaysVisibleClickThrough"
-        settings.windowMode = str(self.window_mode.currentData())
+        # Surprise mode forces (and owns) the floatingLauncher window mode. The combo isn't synced
+        # at activation, so writing its stale value here would silently revert the forced mode.
+        surprise = getattr(self.app, "surprise", None)
+        if not (surprise is not None and surprise.active):
+            settings.windowMode = str(self.window_mode.currentData())
         settings.notificationsEnabled = self.notify_enabled.isChecked()
         settings.notifyMinutesBefore = int(self.notify_minutes.value())
         settings.nearHighlightDays = int(self.near_highlight_days.value())

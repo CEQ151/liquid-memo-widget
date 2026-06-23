@@ -7,7 +7,7 @@ when/where the memo is shown.
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING, Iterable
 
 from PySide6.QtCore import (
@@ -36,7 +36,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QWidget
 
-from state_store import AppState, parse_ddl
+from state_store import AppState, deadline_alert
 from window_layer import (
     apply_tool_window,
     detach_from_parent,
@@ -130,16 +130,12 @@ def panel_position(launcher: QRect, panel_size: QSize, area: QRect) -> QPoint:
 def launcher_alert_status(state: AppState, now: datetime | None = None) -> str:
     """Return ``overdue``, ``near`` or ``none`` for the launcher's status dot."""
     now = now or datetime.now()
-    near_window = timedelta(days=max(1, min(30, int(state.settings.nearHighlightDays or 1))))
     saw_near = False
 
     def classify(raw: str) -> str:
-        deadline = parse_ddl(raw, now)
-        if deadline is None:
-            return "none"
-        if deadline < now:
-            return "overdue"
-        return "near" if deadline - now <= near_window else "none"
+        # The launcher dot has no "normal" state: a far-off or unparseable deadline is "none".
+        status = deadline_alert(raw, state.settings.nearHighlightDays, now)
+        return "none" if status == "normal" else status
 
     for todo in state.todos:
         if todo.done:
@@ -521,6 +517,11 @@ class FloatingModeController(QObject):
         if not self.window.isVisible() or not initial:
             self.window.show()
             self.window.raise_()
+        if not initial:
+            # Returning from the launcher popover (whose position is never persisted): re-apply the
+            # saved normal/edge-mode geometry, otherwise the memo reappears stuck at the popover
+            # anchor instead of where the user left it.
+            self.window.apply_initial_geometry()
         if self.mode == "normal":
             self.window._undock()
         else:

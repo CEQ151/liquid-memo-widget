@@ -60,5 +60,7 @@ def reconcile_startup() -> None:
         current = _read_startup_command()
         if current is not None and current != _command():
             set_startup(True)
-    except OSError:
+    except Exception:
+        # Best-effort reconciliation at launch: a registry error (OSError) or a pathological
+        # sys.argv[0] that trips Path.resolve() must never block startup.
         pass

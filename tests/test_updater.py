@@ -258,10 +258,18 @@ def test_apply_update_aborts_when_verified_termination_fails(tmp_path, monkeypat
     assert installer.exists()
 
 
-def test_terminate_pid_refuses_image_mismatch(monkeypatch):
-    monkeypatch.setattr(updater, "_process_image_path", lambda _pid: "C:/Other/Other.exe")
-
-    assert updater._terminate_pid(4321, "C:/App/App.exe") is False
+def test_terminate_pid_refuses_image_mismatch():
+    # The image-path check and the kill share one handle now, so exercise it with a real process:
+    # its image is the python exe, so an expected path that doesn't match must refuse to terminate.
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        creationflags=updater.CREATE_NO_WINDOW,
+    )
+    try:
+        assert updater._terminate_pid(process.pid, "C:/App/Definitely-Not-Me.exe") is False
+        assert process.poll() is None  # untouched — the mismatch refused the kill
+    finally:
+        process.kill()
 
 
 def test_terminate_pid_stops_verified_stuck_process():

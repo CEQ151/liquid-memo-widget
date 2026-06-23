@@ -32,6 +32,7 @@ class _FakeMemoWindow(QWidget):
         self.undock_calls = 0
         self.dock_calls = 0
         self.refresh_calls = 0
+        self.geometry_calls = 0
 
     def _undock(self) -> None:
         self.undock_calls += 1
@@ -41,6 +42,9 @@ class _FakeMemoWindow(QWidget):
 
     def refresh(self) -> None:
         self.refresh_calls += 1
+
+    def apply_initial_geometry(self) -> None:
+        self.geometry_calls += 1
 
     def protect_content_layer(self) -> None:
         pass
@@ -189,6 +193,8 @@ def test_controller_switches_between_all_three_modes(qapp, harmless_window_layer
     assert app.window.isVisible()
     assert not controller.launcher.isVisible()
     assert app.window.drag_handle.isVisible()
+    # Leaving launcher mode must re-apply the saved geometry (the popover never persists position).
+    assert app.window.geometry_calls >= 1
 
     app.state.settings.windowMode = "edgeHide"
     controller.apply_mode()

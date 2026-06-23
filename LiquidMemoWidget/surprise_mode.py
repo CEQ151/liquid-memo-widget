@@ -41,12 +41,8 @@ from window_layer import set_window_exclude_from_capture
 
 NORMAL_ACCENT = "#009FAA"
 SURPRISE_ACCENT = "#E85D93"
-SURPRISE_BG_TOP = "#FFF8FB"
-SURPRISE_BG_BOTTOM = "#FFE3EC"
 SURPRISE_TEXT = "#4A2334"
 SURPRISE_MUTED = "#8C6574"
-SURPRISE_GOLD = "#C69B64"
-POETIC_FONT_STACK = '"STKaiti", "KaiTi", "FangSong", "Microsoft YaHei UI"'
 
 
 def _poetic_font(pixel_size: int, weight: QFont.Weight = QFont.Normal) -> QFont:
@@ -543,10 +539,12 @@ class SurpriseService:
         return SurpriseTodoRow(self, parent) if self.active else None
 
     def completed_today(self) -> bool:
-        return self.app.state.settings.surpriseCompletedDate == date.today().isoformat()
+        # >= (not ==) so winding the system clock backward can't re-open a day already completed;
+        # an empty stored date sorts before any real date, so "not yet done" still reads False.
+        return self.app.state.settings.surpriseCompletedDate >= date.today().isoformat()
 
     def note_drawn_today(self) -> bool:
-        return self.app.state.settings.surpriseNoteDate == date.today().isoformat()
+        return self.app.state.settings.surpriseNoteDate >= date.today().isoformat()
 
     def complete_today(self) -> None:
         self.app.state.settings.surpriseCompletedDate = date.today().isoformat()
@@ -558,8 +556,13 @@ class SurpriseService:
         if not self.active or not self.completed_today():
             return
         settings = self.app.state.settings
-        if not self.note_drawn_today():
-            count = len(self.payload["notes"])
+        notes = self.payload["notes"]
+        if not notes:
+            return
+        # Re-roll when today's note isn't drawn yet, or when the stored index is out of range — e.g.
+        # a later payload shipped fewer notes — so a stale index can never raise IndexError below.
+        if not self.note_drawn_today() or not (0 <= settings.surpriseNoteIndex < len(notes)):
+            count = len(notes)
             previous = settings.surpriseNoteIndex
             index = QRandomGenerator.global_().bounded(count)
             if count > 1 and index == previous:
@@ -568,20 +571,18 @@ class SurpriseService:
             settings.surpriseNoteDate = date.today().isoformat()
             self.app.save()
             self.app.window.refresh()
-        self.note_dialog.show_note(self.payload["notes"][settings.surpriseNoteIndex], self.app.window)
+        self.note_dialog.show_note(notes[settings.surpriseNoteIndex], self.app.window)
 
     def apply_theme(self) -> None:
         qt = QApplication.instance()
         if qt is not None:
             qt.setProperty("surpriseMode", self.active)
         setThemeColor(SURPRISE_ACCENT if self.active else NORMAL_ACCENT, save=False)
-        for name in ("window", "settings_window", "history_window"):
-            widget = getattr(self.app, name, None)
-            if widget is not None and hasattr(widget, "apply_surprise_theme"):
-                widget.apply_surprise_theme(self.active)
         floating = getattr(self.app, "floating", None)
         if floating is not None:
             floating.launcher.set_surprise_mode(self.active)
+        # window / settings_window / history_window are all parent-less top-level widgets exposing
+        # apply_surprise_theme, so this single sweep covers them — no separate named loop needed.
         for widget in QApplication.topLevelWidgets():
             if hasattr(widget, "apply_surprise_theme"):
                 widget.apply_surprise_theme(self.active)

@@ -4,7 +4,7 @@ import json
 import re
 import shutil
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -76,6 +76,27 @@ def parse_ddl(text: str, now: datetime | None = None) -> datetime | None:
                 pass
         return candidate
     return None
+
+
+def near_highlight_window(near_days: int) -> timedelta:
+    """The "near deadline" amber window, with nearHighlightDays clamped to the 1..30 range the
+    settings spinbox and state loader enforce (defensive: also clamps a hand-edited state file)."""
+    return timedelta(days=max(1, min(30, int(near_days or 1))))
+
+
+def deadline_alert(raw: str, near_days: int, now: datetime | None = None) -> str:
+    """Classify a single deadline string as ``overdue`` / ``near`` / ``normal``.
+
+    ``normal`` covers both an unparseable string and one comfortably in the future. This is the
+    single source of truth shared by TodoRow, CalendarRow and the floating launcher's status dot
+    so the overdue/near boundary cannot drift between them."""
+    now = now or datetime.now()
+    deadline = parse_ddl(raw, now)
+    if deadline is None:
+        return "normal"
+    if deadline < now:
+        return "overdue"
+    return "near" if deadline - now <= near_highlight_window(near_days) else "normal"
 
 
 @dataclass

@@ -350,9 +350,6 @@ class UpdateManager:
         if self._checking:
             return
         self._checking = True
-        # Stamp the check time (both silent and manual) so the throttle clock is reset.
-        self.app.state.settings.lastUpdateCheckAt = datetime.now(timezone.utc).isoformat()
-        self.app.save_later()
         self.app.settings_window.set_update_status("正在检查更新…")
         self._fetch(
             tag=None,
@@ -369,6 +366,10 @@ class UpdateManager:
 
     def _on_checked(self, release: updater.ReleaseInfo, silent: bool) -> None:
         self._checking = False
+        # Stamp the throttle clock only on a *successful* check, so a transient failure (offline /
+        # DNS / GitHub 5xx) doesn't reset it and silence the next auto-check for 12h.
+        self.app.state.settings.lastUpdateCheckAt = datetime.now(timezone.utc).isoformat()
+        self.app.save_later()
         if updater.is_newer(release.version):
             self.app.settings_window.set_update_status(f"发现新版本 {release.tag}")
             # A manual check always re-opens the dialog. A silent (startup) check prompts at
