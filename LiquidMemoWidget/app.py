@@ -59,20 +59,19 @@ from skin_editor import load_skin_pixmap, mean_luminance as image_mean_luminance
 from state_store import CalendarEvent, Settings, StateStore, TodoItem, deadline_alert, parse_ddl, utc_now
 from wheel_hook import GlobalWheelHook
 from window_layer import (
-    HTBOTTOM,
     HTCAPTION,
     HTCLIENT,
     HTTRANSPARENT,
     WM_ENTERSIZEMOVE,
     WM_EXITSIZEMOVE,
-    WM_NCLBUTTONDBLCLK,
     WM_NCHITTEST,
     apply_tool_window,
     begin_system_move,
     detach_from_parent,
+    set_capture_exclusion,
     set_rounded_corners,
     set_topmost,
-    set_window_exclude_from_capture,
+    protect_window_from_capture,
 )
 from qframelesswindow.windows.window_effect import WindowsWindowEffect
 from ui_common import (
@@ -101,6 +100,8 @@ from notify_manager import NotificationManager
 from startup import reconcile_startup
 from floating_launcher import FloatingModeController
 from surprise_mode import SurpriseService, SURPRISE_TEXT
+from surprise_swirl import SwirlThemeTokens, swirl_tokens
+from surprise_ink import make_surprise_background
 
 
 MIN_WIDTH = 320
@@ -108,7 +109,6 @@ MAX_WIDTH = 720
 MAX_WIDTH_RATIO = 0.52
 MIN_HEIGHT = 320
 MAX_HEIGHT_RATIO = 0.7
-RESIZE_MARGIN = 6
 SURPRISE_MIN_WIDTH = 400
 # A vertical scrollbar lives inside the list viewport. Reserve its full painted width in the
 # collapsed layout even before Qt decides whether it is needed; otherwise adding the special
@@ -976,15 +976,22 @@ ACRYLIC_TEXT_DARK = "#1B2127"
 ACRYLIC_TEXT_LIGHT = "#E8ECEF"
 
 
-class SurpriseSkin(AcrylicSkin):
-    """Themed frost for the opt-in surprise mode: a fixed pink tint and a fixed soft text color.
+class SurpriseSkin:
+    """Dynamic ink-wash surface used only while the encrypted surprise mode is active. Its colour
+    (and the overlay-safe text colour) follow the chosen 拾光纸条 theme."""
 
-    Subclassing AcrylicSkin keeps ``kind == "acrylic"`` so it flows through the normal acrylic
-    dispatch; the themed look lives here in one place instead of being special-cased across
-    _make_skin / _apply_acrylic_effect / _normal_text_color."""
+    kind = "surprise_swirl"
+    geometry_scale = 1.0
+    corner_margin = 14
 
-    acrylic_tint = "#FFDDE8"
-    text_override = SURPRISE_TEXT
+    def __init__(self, text_override: "str | None" = None) -> None:
+        self.text_override = text_override or SwirlThemeTokens().text_overlay_safe
+
+    def vertical_padding(self, height: int) -> int:
+        return 0
+
+    def horizontal_padding(self, width: int) -> int:
+        return 0
 
 
 class ImageSkin:
@@ -1051,6 +1058,12 @@ class MemoWindow(QWidget):
         self._image_bg: _ImageBackground | None = None
         self._image_pixmap: QPixmap | None = None
         self._image_luminance: float = 1.0
+        # Surprise-mode background: GPU ink-wash when available, else the QPainter swirl
+        # (see surprise_ink.make_surprise_background). Either exposes the same lifecycle.
+        # `_surprise_swirl_theme` tracks which 拾光纸条 palette the live widget was built for, so a
+        # theme switch rebuilds it instead of keeping the stale colours.
+        self._surprise_swirl_bg: QWidget | None = None
+        self._surprise_swirl_theme: str | None = None
         self.setWindowTitle("桌面备忘")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -1151,14 +1164,19 @@ class MemoWindow(QWidget):
         self.add_popup = TodoEditorPopup(self)
 
     def protect_content_layer(self) -> None:
-        # Keep the content layer above the surface and excluded from any screen capture (so
-        # screenshots / recordings of the desktop don't grab the widget's own text).
+        # Keep the content layer above the surface and apply the current screen-capture policy (by
+        # default the widget is excluded from screenshots / recordings; the 允许被截屏 setting can
+        # opt back in — see window_layer.set_capture_exclusion).
         if self.container:
             self.container.raise_()
-        set_window_exclude_from_capture(int(self.winId()), exclude=True)
+        protect_window_from_capture(int(self.winId()))
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        # Only spin the swirl when it is the active surface — in surprise mode the user may have
+        # picked the frost/image skin instead, leaving the swirl widget allocated but hidden.
+        if self._surprise_swirl_bg is not None and self._active_skin_kind == "surprise_swirl":
+            self._surprise_swirl_bg.start()
         self.protect_content_layer()
         for delay in (0, 80, 180, 420):
             QTimer.singleShot(delay, self.protect_content_layer)
@@ -1182,6 +1200,8 @@ class MemoWindow(QWidget):
         self._hide_timer.stop()
         self._cancel_slide()
         self._dock_animating = False
+        if self._surprise_swirl_bg is not None:
+            self._surprise_swirl_bg.stop()
         super().hideEvent(event)
 
     def cleanup(self) -> None:
@@ -1190,6 +1210,8 @@ class MemoWindow(QWidget):
         self._dock_poll.stop()
         self._hide_timer.stop()
         self._cancel_slide()
+        if self._surprise_swirl_bg is not None:
+            self._surprise_swirl_bg.cleanup()
 
     def moveEvent(self, event) -> None:
         super().moveEvent(event)
@@ -1217,16 +1239,8 @@ class MemoWindow(QWidget):
             self.container.setGeometry(0, 0, self.width(), self.height())
         if self._image_bg is not None:
             self._image_bg.setGeometry(0, 0, self.width(), self.height())
-        if (
-            self._is_window_moving
-            and not self._expanded
-            and event.oldSize().height() != event.size().height()
-        ):
-            # Programmatic content-fit resizes happen outside the native size/move loop, so only
-            # a real bottom-edge drag reaches this branch and becomes the user's saved height.
-            self.app.state.window.manualHeight = self.height()
-            self.app.state.window.height = self.height()
-            self.app.save_later()
+        if self._surprise_swirl_bg is not None:
+            self._surprise_swirl_bg.setGeometry(0, 0, self.width(), self.height())
 
     def nativeEvent(self, event_type, message):
         if event_type == b"windows_generic_MSG":
@@ -1242,13 +1256,6 @@ class MemoWindow(QWidget):
                 # the window receives WM_MOUSEMOVE over it and can slide back out.
                 if self._dock_hidden and not self._dock_animating and self._peek_rect_local().contains(local):
                     return True, HTCLIENT
-                if (
-                    not self._expanded
-                    and self.app.state.settings.windowMode != "floatingLauncher"
-                    and 0 <= local.x() < self.width()
-                    and self.height() - RESIZE_MARGIN <= local.y() <= self.height()
-                ):
-                    return True, HTBOTTOM
                 if self.drag_handle.isVisible() and self._rect_for(self.drag_handle).contains(local):
                     return True, HTCAPTION
                 if self._point_over_todo_row(local):
@@ -1257,11 +1264,6 @@ class MemoWindow(QWidget):
                     return True, HTCLIENT
                 if self.app.state.settings.layerMode == "alwaysVisibleClickThrough":
                     return True, HTTRANSPARENT
-            if msg.message == WM_NCLBUTTONDBLCLK and int(msg.wParam) == HTBOTTOM:
-                self.app.state.window.manualHeight = None
-                self.app.save_later()
-                self.refresh()
-                return True, 0
             if msg.message == WM_MOUSEMOVE:
                 # Only the peek strip is HTCLIENT while hidden, so any mouse-move here means the
                 # cursor reached the strip — slide the window back out.
@@ -1518,8 +1520,16 @@ class MemoWindow(QWidget):
         self.move(x, y)
 
     def _make_skin(self, skin_name: str):
-        if getattr(self.app, "surprise", None) is not None and self.app.surprise.active:
-            return SurpriseSkin()
+        surprise = getattr(self.app, "surprise", None)
+        surprise_active = surprise is not None and surprise.active
+        if skin_name == "surprise_swirl":
+            # The swirl is a real, selectable skin, but only valid while surprise mode is active —
+            # outside it (or in a hand-edited state) it falls back to the frost skin, so the
+            # encrypted-only background can never render without the decrypted payload.
+            if surprise_active:
+                key = self.app.state.settings.surpriseNoteTheme
+                return SurpriseSkin(text_override=swirl_tokens(key).text_overlay_safe)
+            return AcrylicSkin()
         if skin_name.startswith("image:"):
             skin_id = skin_name[len("image:"):]
             custom = next((s for s in self.app.state.settings.customSkins if s.id == skin_id), None)
@@ -1538,6 +1548,8 @@ class MemoWindow(QWidget):
         skin_changed = self._active_skin_kind not in (None, new_kind)
         if new_kind == "image":
             self._apply_image_mode()
+        elif new_kind == "surprise_swirl":
+            self._apply_surprise_swirl_mode()
         else:
             self._apply_acrylic_mode()
         # Frost and image use the same full-fill geometry, but switching between them swaps the
@@ -1554,6 +1566,7 @@ class MemoWindow(QWidget):
         # is hidden so the frost shows through.
         self._active_skin_kind = "acrylic"
         self._hide_image_bg()
+        self._hide_surprise_swirl_bg()
         self._apply_acrylic_effect()
         self.apply_text_colors()
 
@@ -1567,11 +1580,44 @@ class MemoWindow(QWidget):
         if self._image_bg is not None:
             self._image_bg.hide()
 
+    def _ensure_surprise_swirl_bg(self, theme_key: str) -> QWidget:
+        if self._surprise_swirl_bg is None:
+            self._surprise_swirl_bg = make_surprise_background(self, theme_key)
+            self._surprise_swirl_theme = theme_key
+            self._surprise_swirl_bg.setGeometry(0, 0, self.width(), self.height())
+        elif self._surprise_swirl_theme != theme_key:
+            # Recolour in place so the note-theme switch doesn't tear down / rebuild the GL context.
+            self._surprise_swirl_bg.set_theme(theme_key)
+            self._surprise_swirl_theme = theme_key
+        return self._surprise_swirl_bg
+
+    def _hide_surprise_swirl_bg(self) -> None:
+        if self._surprise_swirl_bg is not None:
+            self._surprise_swirl_bg.setActive(False)
+            self._surprise_swirl_bg.hide()
+
+    def _apply_surprise_swirl_mode(self) -> None:
+        self._active_skin_kind = "surprise_swirl"
+        self._remove_acrylic()
+        self._hide_image_bg()
+        background = self._ensure_surprise_swirl_bg(self.app.state.settings.surpriseNoteTheme)
+        background.setActive(True)
+        background.setGeometry(0, 0, self.width(), self.height())
+        background.show()
+        background.lower()
+        if self.container:
+            self.container.raise_()
+        if self.isVisible():
+            background.start()
+        set_rounded_corners(int(self.winId()), True)
+        self.apply_text_colors()
+
     def _apply_image_mode(self) -> None:
         # Static image surface: _image_bg paints the cover-scaled image below the
         # (capture-excluded) content layer, and DWM rounds the window corners.
         self._active_skin_kind = "image"
         self._remove_acrylic()
+        self._hide_surprise_swirl_bg()
         path = getattr(self.skin, "image_path", None)
         pixmap = load_skin_pixmap(path) if path is not None else None
         self._image_pixmap = pixmap
@@ -1793,8 +1839,8 @@ class MemoWindow(QWidget):
         return self._normal_text_color()
 
     def text_needs_halo(self) -> bool:
-        # Both remaining skins are even, static surfaces with deterministic text — never any halo.
-        # (Kept as a method because TodoRow/CalendarRow constructors call it.)
+        # Every surface provides a stable readability base; the swirl adds its own calm veil.
+        # Kept as a method because TodoRow/CalendarRow constructors call it.
         return False
 
     def apply_text_colors(self) -> None:
@@ -1853,20 +1899,9 @@ class MemoWindow(QWidget):
             self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff if fits else Qt.ScrollBarAsNeeded)
             self.setFixedHeight(height)
         else:
-            auto_height = min(wanted, int(screen.height() * MAX_HEIGHT_RATIO), screen_cap)
-            manual_height = self.app.state.window.manualHeight
-            try:
-                manual_height = int(manual_height) if manual_height is not None else None
-            except (TypeError, ValueError):
-                manual_height = None
-            height = max(MIN_HEIGHT, min(manual_height, screen_cap)) if manual_height is not None else auto_height
+            height = min(wanted, int(screen.height() * MAX_HEIGHT_RATIO), screen_cap)
             self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-            # Width remains content-driven and fixed, but the native HTBOTTOM edge may resize
-            # height anywhere inside the usable screen. resizeEvent persists only user drags.
-            self.setMinimumHeight(MIN_HEIGHT)
-            self.setMaximumHeight(screen_cap)
-            if self.height() != height:
-                self.resize(width, height)
+            self.setFixedHeight(height)
 
         # Inset the content. Both skins fill the window (geometry_scale = 1.0 → vertical/horizontal
         # padding are 0), so this collapses to OUTER_X horizontally and the corner margin vertically.
@@ -2041,6 +2076,9 @@ class LiquidMemoApp:
         self.qt.setStyleSheet(f"* {{ {FONT_STACK_QSS} }}")
         self.store = StateStore()
         self.state = self.store.load()
+        # Set the screen-capture policy before any window is created, so each window's showEvent
+        # applies the right affinity from the first show.
+        set_capture_exclusion(not self.state.settings.allowScreenshot)
         self.save_timer = QTimer()
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self.save)
@@ -2079,6 +2117,20 @@ class LiquidMemoApp:
 
     def save(self) -> None:
         self.store.save(self.state)
+
+    def apply_capture_policy(self) -> None:
+        """Update the process-wide screen-capture policy from settings and re-apply it to the
+        windows that opt out of capture (memo / launcher / note dialog) that may already be shown.
+        Hidden windows pick it up from their showEvent."""
+        set_capture_exclusion(not self.state.settings.allowScreenshot)
+        self.window.protect_content_layer()
+        surprise = getattr(self, "surprise", None)
+        note_dialog = surprise.note_dialog if surprise is not None else None
+        floating = getattr(self, "floating", None)
+        launcher = floating.launcher if floating is not None else None
+        for widget in (launcher, note_dialog):
+            if widget is not None and widget.isVisible():
+                protect_window_from_capture(int(widget.winId()))
 
     def archive_todo(self, todo_id: str) -> None:
         for index, todo in enumerate(self.state.todos):

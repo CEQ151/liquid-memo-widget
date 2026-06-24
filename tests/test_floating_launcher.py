@@ -77,7 +77,7 @@ def harmless_window_layer(monkeypatch):
     monkeypatch.setattr(launcher_module, "apply_tool_window", lambda *_args: None)
     monkeypatch.setattr(launcher_module, "detach_from_parent", lambda *_args: None)
     monkeypatch.setattr(launcher_module, "set_topmost", lambda *_args: None)
-    monkeypatch.setattr(launcher_module, "set_window_exclude_from_capture", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(launcher_module, "protect_window_from_capture", lambda *_args, **_kwargs: True)
 
 
 @pytest.mark.parametrize(

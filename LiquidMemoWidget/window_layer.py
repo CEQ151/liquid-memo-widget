@@ -34,12 +34,10 @@ SWP_SHOWWINDOW = 0x0040
 
 WM_NCHITTEST = 0x0084
 WM_NCLBUTTONDOWN = 0x00A1
-WM_NCLBUTTONDBLCLK = 0x00A3
 WM_ENTERSIZEMOVE = 0x0231
 WM_EXITSIZEMOVE = 0x0232
 HTCLIENT = 1
 HTCAPTION = 2
-HTBOTTOM = 15
 HTTRANSPARENT = -1
 
 ReleaseCapture = user32.ReleaseCapture
@@ -74,6 +72,25 @@ def set_window_exclude_from_capture(hwnd: int, exclude: bool = True) -> bool:
         return False
     affinity = WDA_EXCLUDEFROMCAPTURE if exclude else WDA_NONE
     return bool(SetWindowDisplayAffinity(wintypes.HWND(hwnd), affinity))
+
+
+# Process-wide policy for whether the app's windows opt out of screen capture. The launcher and the
+# surprise note dialog are decoupled (no app reference), so they read this shared policy in their
+# showEvent via protect_window_from_capture() instead of each carrying the setting. The app sets it
+# from Settings.allowScreenshot at startup and whenever the toggle changes. Default True preserves
+# the historical "never captured" behavior until the loaded setting overrides it.
+_exclude_from_capture = True
+
+
+def set_capture_exclusion(exclude: bool) -> None:
+    """Set the process-wide capture policy (True = windows are hidden from screenshots/recordings)."""
+    global _exclude_from_capture
+    _exclude_from_capture = bool(exclude)
+
+
+def protect_window_from_capture(hwnd: int) -> bool:
+    """Apply the current process-wide capture policy to a window (call from showEvent / on apply)."""
+    return set_window_exclude_from_capture(hwnd, exclude=_exclude_from_capture)
 
 
 def apply_tool_window(hwnd: int) -> None:

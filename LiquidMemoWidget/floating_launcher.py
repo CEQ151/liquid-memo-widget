@@ -40,8 +40,8 @@ from state_store import AppState, deadline_alert
 from window_layer import (
     apply_tool_window,
     detach_from_parent,
+    protect_window_from_capture,
     set_topmost,
-    set_window_exclude_from_capture,
 )
 
 if TYPE_CHECKING:
@@ -253,7 +253,7 @@ class FloatingLauncherWindow(QWidget):
             detach_from_parent(hwnd)
             set_topmost(hwnd, True)
             self._window_layer_applied = True
-        set_window_exclude_from_capture(int(self.winId()), exclude=True)
+        protect_window_from_capture(int(self.winId()))
         self._idle_animation.start()
         self._shine_animation.start()
 

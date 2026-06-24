@@ -132,9 +132,6 @@ class WindowState:
     y: int | None = None
     width: int = 320
     height: int = 320
-    # User-dragged height (bottom-edge resize) in collapsed mode; None means auto-fit to content.
-    # Double-clicking the bottom edge clears it. Clamped to the screen at use-time.
-    manualHeight: int | None = None
     # Independent position of the floating-launcher bubble. None uses the default position on
     # the primary screen; stale/off-screen values are clamped when the launcher is shown.
     launcherX: int | None = None
@@ -208,6 +205,10 @@ class Settings:
     # Window presentation: regular memo, edge-docked auto-hide, or a small floating launcher
     # that opens the memo on demand. Older edgeAutoHide states migrate in AppState.from_dict.
     windowMode: str = "edgeHide"
+    # When False (default) the memo / launcher / note dialog opt out of screen capture
+    # (WDA_EXCLUDEFROMCAPTURE), so screenshots and recordings of the desktop don't grab them.
+    # Set True to let them appear in captures (drives window_layer.set_capture_exclusion).
+    allowScreenshot: bool = False
     # Calendar subscription: when enabled, the widget syncs the next `calendarSyncDays` days of
     # events from the checked ICS/webcal feeds and shows them in a separate "日程" group.
     # Deleted feeds move to `calendarFeedArchive` so an accidental deletion can be restored.
@@ -242,9 +243,11 @@ class Settings:
     surpriseEnabled: bool = False
     surpriseKeyBlob: str = ""
     preSurpriseWindowMode: str = ""
+    preSurpriseSkin: str = ""
     surpriseCompletedDate: str = ""
     surpriseNoteDate: str = ""
     surpriseNoteIndex: int = -1
+    surpriseNoteTheme: str = "qinghua"
 
     def active_calendar_feeds(self) -> list[CalendarFeed]:
         """Feeds that are checked and have a URL — the only ones synced and displayed."""
@@ -322,10 +325,15 @@ class AppState:
         settings.customSkins = [CustomSkin.from_dict(item) for item in settings_data.get("customSkins") or []]
         # The "glass" (real-time D3D liquid-glass) skin was removed; it is intentionally absent
         # from valid_skins so any saved "glass" selection normalizes back to the frost skin below.
-        valid_skins = {"acrylic"} | {f"image:{s.id}" for s in settings.customSkins}
+        # "surprise_swirl" is a valid stored value so an active surprise session survives a restart,
+        # but it only ever *renders* / appears in the picker while surprise mode is active (gated in
+        # MemoWindow._make_skin and SettingsWindow._refresh_skin_combo, both keyed on the decrypted
+        # payload) — so it cannot leak to a normal user even by hand-editing this file.
+        valid_skins = {"acrylic", "surprise_swirl"} | {f"image:{s.id}" for s in settings.customSkins}
         if settings.skin not in valid_skins:
             settings.skin = "acrylic"
         settings.calendarSyncDays = max(1, min(30, int(settings.calendarSyncDays or 7)))
+        settings.allowScreenshot = bool(settings.allowScreenshot)
         settings.notificationsEnabled = bool(settings.notificationsEnabled)
         settings.autoCheckUpdates = bool(settings.autoCheckUpdates)
         settings.notifyMinutesBefore = max(1, min(1440, int(settings.notifyMinutesBefore or 15)))
@@ -335,6 +343,8 @@ class AppState:
             settings.surpriseNoteIndex = int(settings.surpriseNoteIndex)
         except (TypeError, ValueError):
             settings.surpriseNoteIndex = -1
+        if settings.surpriseNoteTheme not in {"qinghua", "warm", "blush"}:
+            settings.surpriseNoteTheme = "qinghua"
         settings.calendarFeeds = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeeds") or []]
         settings.calendarFeedArchive = [CalendarFeed.from_dict(item) for item in settings_data.get("calendarFeedArchive") or []]
         window = WindowState(**{key: window_data.get(key, value) for key, value in window_defaults.items()})

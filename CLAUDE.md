@@ -64,9 +64,19 @@ without import cycles. Key files:
 - `floating_launcher.py` — the painted 72px launcher plus `FloatingModeController`, pure panel-
   placement helpers, and launcher deadline-status calculation.
 - `surprise_crypto.py` / `surprise_mode.py` — authenticated encrypted optional-content loading,
-  per-Windows-user key sealing, the opt-in themed mode and its daily pinned row/note UI. The
-  personalized payload is committed only as `surprise.enc`; never put its plaintext or passphrase
-  in source, tests, documentation, shell arguments, or CI variables.
+  per-Windows-user key sealing, the opt-in themed mode and its daily pinned row/note UI. Also home
+  to `NoteTheme` / `NOTE_THEMES` (the three selectable 拾光纸条 palettes — qinghua/warm/blush —
+  keyed by `settings.surpriseNoteTheme`) which colour the note popup, the in-memo row, and (via the
+  matching keys in `surprise_swirl`/`surprise_ink`) the swirl background. The personalized payload
+  is committed only as `surprise.enc`; never put its plaintext or passphrase in source, tests,
+  documentation, shell arguments, or CI variables.
+- `surprise_swirl.py` — the animated "fluid" background's `QPainter` fallback, shown only while
+  surprise mode is active. Pure `QWidget`/`QPainter` (no GPU, no screen capture); exports
+  `SwirlPainterFallback` (the widget), `SwirlThemeTokens`/`SwirlConfig`, `SwirlInteractionController`,
+  and `SWIRL_TOKENS_BY_THEME`/`swirl_tokens(theme_key)` (per-note-theme palettes).
+- `surprise_ink.py` — `make_surprise_background(parent, theme_key)`: returns the GPU ink-wash
+  (`experimental_fluid.FluidGLWidget`, themed via `_INK_PALETTE_BY_THEME`) when OpenGL is usable,
+  else the themed `SwirlPainterFallback`. `app.py` drives whichever it returns through `SurpriseSkin`.
 - `app.py` — `MemoWindow` (the translucent window), the memo content widgets/popups,
   `HistoryWindow`, the `AcrylicSkin`/`ImageSkin` skins, and `LiquidMemoApp`
   (lifecycle/orchestration); imports the four modules above.
@@ -81,16 +91,31 @@ by the active skin, not by Qt painting:
 - **`AcrylicSkin` (default):** `WindowsWindowEffect.setAcrylicEffect` applies a DWM acrylic frost
   to the hwnd; `set_rounded_corners` rounds it. No screen capture, no GPU effects, no per-frame loop.
 - **`ImageSkin`:** an `_ImageBackground` child paints a cover-scaled static image below the content.
+- **`SurpriseSkin` (kind `"surprise_swirl"`):** an animated ink-wash surface painted below the
+  content, themed to `settings.surpriseNoteTheme` (qinghua blue / warm sepia / blush rose). The
+  background widget comes from `surprise_ink.make_surprise_background(parent, theme_key)` — the GPU
+  ink-wash (`experimental_fluid.FluidGLWidget`) when OpenGL is available, else the `QPainter`
+  `SwirlPainterFallback`. This is the one **animated** skin (a timer-driven loop, started/stopped on
+  show/hide); the "no per-frame loop" note above is specific to the static frost/image skins. The
+  invariant that still holds for *every* skin is **no desktop screen
+  capture** — animation done in-process is fine; sampling/refracting the desktop
+  behind the window is the removed glass path and must not come back.
 
 **All interactive content lives in `self.container`** (a transparent child `QWidget` exposed as
-`MemoWindow.content`), created directly in `__init__` and kept sized to the window. Both skins
-are static surfaces (`geometry_scale = 1.0`), so content fills the window minus a small corner
-margin; `_resize_for_content` solves the window height from the content and calls `setFixedSize`.
+`MemoWindow.content`), created directly in `__init__` and kept sized to the window. All three
+skins use full-fill geometry (`geometry_scale = 1.0`), so content fills the window minus a small
+corner margin; `_resize_for_content` solves the window height from the content and calls
+`setFixedSize`.
 
-**Capture-exclusion invariant:** `protect_content_layer()` raises the content layer and calls
-`set_window_exclude_from_capture` (`SetWindowDisplayAffinity` / `WDA_EXCLUDEFROMCAPTURE`, now a
-plain helper in `window_layer.py`) so screenshots / screen recordings of the desktop don't grab
-the widget's own text. It's re-called on show/move/settings-apply with staggered
+**Capture-exclusion policy:** `protect_content_layer()` raises the content layer and calls
+`protect_window_from_capture` (`window_layer.py`), which applies the process-wide policy via
+`SetWindowDisplayAffinity` (`WDA_EXCLUDEFROMCAPTURE` vs `WDA_NONE`). By default the memo, launcher,
+and surprise note dialog opt out of capture so screenshots / recordings of the desktop don't grab
+the widget's text; the `行为 → 允许被截屏` toggle (`Settings.allowScreenshot`) flips it. The policy
+is a module global set by `window_layer.set_capture_exclusion` — the app sets it from settings
+before any window is created and re-applies live via `LiquidMemoApp.apply_capture_policy()` when the
+toggle changes (the decoupled launcher / note dialog read the policy in their `showEvent` instead of
+holding an app reference). It's re-applied on show/move/settings-apply with staggered
 `QTimer.singleShot` retries because Windows resets the affinity on various window-state changes.
 
 ### Text color is deterministic (no sampling)
@@ -109,16 +134,25 @@ The widget handles Win32 messages directly (no Qt-driven move):
 - `WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE` bracket a native move (`_begin_window_move`/`_end_window_move`,
   which just track state, persist position, and re-protect the content layer — the frost / image
   follows the window natively, so there's nothing to spin up).
-- Collapsed mode also returns `HTBOTTOM` over the bottom resize strip. Todo rows return
-  `HTCLIENT` for drag-reordering; calendar rows remain read-only/click-through outside checkbox.
+- Todo rows return `HTCLIENT` for drag-reordering; calendar rows remain
+  read-only/click-through outside their checkbox.
 - `window_layer.py` applies tool-window ex-style (no taskbar entry), detaches from any parent,
   and pins topmost.
 
 ### Settings → skin dispatch
-`apply_settings` resolves `settings.skin` via `_make_skin` (an `"image:<id>"` with a missing file
-falls back to `AcrylicSkin`) and dispatches to `_apply_acrylic_mode` / `_apply_image_mode`, which
-swap the DWM frost vs. the image layer. `windowTint` tints the acrylic frost; the removed
-`glassOpacity` / `liquidStrength` settings were glass-only and no longer exist.
+`apply_settings` resolves `settings.skin` via `_make_skin` and dispatches on the resolved skin's
+`kind` to `_apply_acrylic_mode` / `_apply_image_mode` / `_apply_surprise_swirl_mode`, which swap
+the DWM frost, the image layer, or the animated swirl layer. `_make_skin` precedence:
+`"surprise_swirl"` resolves to `SurpriseSkin` **only while surprise mode is active** (otherwise it
+falls back to `AcrylicSkin`, so the encrypted-only swirl can never render or appear in the picker
+without the decrypted payload); an `"image:<id>"` with a missing file falls back to `AcrylicSkin`;
+otherwise `AcrylicSkin`. The swirl is a real, *selectable* skin: activation auto-switches to it
+(remembering the prior skin in `preSurpriseSkin`) but the user can pick frost/image while still in
+surprise mode, and deactivation restores `preSurpriseSkin`. The swirl/ink-wash colour follows
+`settings.surpriseNoteTheme` (`SurpriseSkin.text_override` + `make_surprise_background(parent,
+theme_key)`; `MemoWindow._surprise_swirl_theme` rebuilds the background widget when the theme
+changes). `windowTint` tints the acrylic frost; the removed `glassOpacity` / `liquidStrength`
+settings were glass-only and no longer exist.
 
 ### State & persistence (`state_store.py`)
 Dataclasses `AppState / Settings / WindowState / TodoItem` serialize to
@@ -131,8 +165,13 @@ use `save()` directly only when immediate persistence is required. Completed tod
 `edgeAutoHide` state migrates into that enum. The launcher position is stored independently from
 the memo position and clamped to the live monitor layout when shown.
 State v6 adds the optional encrypted-mode flags, a DPAPI-protected derived key, and date/index
-markers for its once-per-day completion/note behavior. Disabling it clears those fields and
-restores the window mode that was active before activation.
+markers for its once-per-day completion/note behavior, plus `surpriseNoteTheme` (the selectable
+拾光纸条 palette, also driving the swirl colour) and `preSurpriseSkin` (the skin to restore on
+exit, mirroring `preSurpriseWindowMode`). Activation forces `windowMode = floatingLauncher` and
+auto-selects `skin = "surprise_swirl"`. Disabling it clears the encrypted-mode fields and restores
+both the window mode and the skin that were active before activation. `"surprise_swirl"` is an
+accepted stored `skin` value (so an active session survives a restart) but only renders / appears
+in the picker while surprise mode is active.
 
 ### Encrypted optional payload
 `tools/encrypt_surprise.py` reads a gitignored private JSON and prompts twice for the passphrase;
@@ -180,3 +219,24 @@ launch. The helper records checksum, exit, installer-return-code, and relaunch e
 The silent startup check is throttled (`Settings.lastUpdateCheckAt`, every 12h), gated by
 `Settings.autoCheckUpdates` (a 关于-section toggle), and won't re-prompt for a version the user
 dismissed (`Settings.lastDismissedUpdateVersion`); a manual "检查更新" bypasses all of these.
+
+### GPU fluid ink-wash (`LiquidMemoWidget/experimental_fluid/`)
+An OpenGL 3.3 Core / `QOpenGLWidget` + PyOpenGL fluid solver (curl → vorticity → divergence →
+pressure Jacobi → gradient-subtract → advection → splat, GLSL in `shaders/`). The algorithm was
+ported from the WebGL reference (`WebGL-Fluid-Simulation/`, kept locally but **gitignored** — it's
+a port source, not needed at runtime; see `THIRD_PARTY_NOTICES.md`). Run the standalone tuner demo:
+`python -m LiquidMemoWidget.experimental_fluid.fluid_demo_window`.
+
+This **ships**: `surprise_ink.make_surprise_background(parent, theme_key)` returns `FluidGLWidget`
+(themed via `fluid_config.FluidConfig`) as the surprise-mode background when OpenGL is usable, and
+falls back to the QPainter `surprise_swirl.SwirlPainterFallback` otherwise. Both expose the same
+lifecycle (`start`/`stop`/`setActive`/`cleanup`/`setGeometry`/`set_theme`); `MemoWindow` drives
+whichever it gets through `SurpriseSkin`.
+- **PyOpenGL is a real dependency** — present in `requirements.txt` and bundled by `Build.ps1`
+  (`--collect-all OpenGL`, the `OpenGL.platform.win32` / `PySide6.QtOpenGL*` hidden-imports). The
+  whole `experimental_fluid/` (incl. `shaders/`) ships via the existing `--add-data LiquidMemoWidget`.
+- `set_theme(theme_key)` recolours in place (GL uploads the palette uniforms each frame; the swirl
+  re-bakes its colour layers), so a note-theme switch never rebuilds the GL context.
+- `fluid_demo_window.py` / `inkwash_tuner.html` are dev-only tools (committed, not used at runtime).
+  `_fluid_debug.log` (repo root) and `experimental_fluid/fenxi.txt` / `surprise_bg_spike.py` are
+  scratch, gitignored; don't treat them as sources of truth.

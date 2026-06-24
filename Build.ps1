@@ -14,6 +14,7 @@ python -m PyInstaller `
   --collect-all icalendar `
   --collect-all recurring_ical_events `
   --collect-all cryptography `
+  --collect-all OpenGL `
   --collect-submodules dateutil `
   --collect-data tzdata `
   --hidden-import xml.etree.ElementTree `
@@ -22,6 +23,9 @@ python -m PyInstaller `
   --hidden-import ctypes `
   --hidden-import json `
   --hidden-import os `
+  --hidden-import OpenGL.platform.win32 `
+  --hidden-import PySide6.QtOpenGLWidgets `
+  --hidden-import PySide6.QtOpenGL `
   --icon "$root\assets\logo.ico" `
   --add-data "$root\assets\logo.ico;assets" `
   --add-data "$root\LiquidMemoWidget;LiquidMemoWidget" `

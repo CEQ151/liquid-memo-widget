@@ -15,6 +15,19 @@ defined by their respective upstream projects, including but not limited to:
 
 - PySide6
 - PySide6-Fluent-Widgets
+- PyOpenGL
+- cryptography
+- icalendar
+- recurring-ical-events
+
+## Ink-wash fluid background
+
+The optional animated ink-wash background renders with a GLSL fluid solver written for OpenGL 3.3
+Core / PySide6 `QOpenGLWidget`. No source is copied verbatim, but the algorithm structure (curl →
+vorticity → divergence → pressure Jacobi → gradient-subtract → advection → splat) is adapted from:
+
+- Pavel Dobryakov, *WebGL-Fluid-Simulation* (<https://github.com/PavelDoGreat/WebGL-Fluid-Simulation>, MIT)
+- Jos Stam, *Stable Fluids* (SIGGRAPH 1999)
 
 ## Notes
 

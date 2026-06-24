@@ -73,6 +73,38 @@ def test_surprise_state_roundtrips_and_normalizes_index():
     assert restored.settings.surpriseNoteIndex == 4
 
 
+def test_swirl_fallback_set_theme_recolours_in_place(qapp):
+    from surprise_swirl import SwirlPainterFallback, swirl_tokens
+
+    bg = SwirlPainterFallback(tokens=swirl_tokens("qinghua"))
+    assert bg.tokens is swirl_tokens("qinghua")
+
+    bg.set_theme("warm")  # in-place recolour, no widget rebuild
+    assert bg.tokens is swirl_tokens("warm")
+    assert bg.tokens.text_overlay_safe == "#3A2A22"
+
+    bg.cleanup()
+
+
+def test_surprise_swirl_skin_persists_only_with_marker():
+    payload = asdict(AppState())
+    payload["settings"].update(skin="surprise_swirl", preSurpriseSkin="acrylic")
+
+    restored = AppState.from_dict(payload)
+
+    # "surprise_swirl" is a valid stored skin (so an active session survives a restart) and the
+    # pre-activation skin marker round-trips.
+    assert restored.settings.skin == "surprise_swirl"
+    assert restored.settings.preSurpriseSkin == "acrylic"
+
+
+def test_unknown_skin_falls_back_to_acrylic():
+    payload = asdict(AppState())
+    payload["settings"].update(skin="glass")  # removed skin
+
+    assert AppState.from_dict(payload).settings.skin == "acrylic"
+
+
 def test_activation_daily_completion_and_restore_do_not_touch_user_todos(qapp, monkeypatch):
     import surprise_mode as surprise_module
 
@@ -116,6 +148,9 @@ def test_activation_daily_completion_and_restore_do_not_touch_user_todos(qapp, m
     assert state.settings.windowMode == "floatingLauncher"
     assert state.settings.preSurpriseWindowMode == "normal"
     assert state.settings.surpriseKeyBlob == "sealed-key"
+    # Activation auto-switches to the swirl skin and remembers the prior one.
+    assert state.settings.skin == "surprise_swirl"
+    assert state.settings.preSurpriseSkin == "acrylic"
     assert floating.apply_calls == 1
     assert floating.expand_calls == 1
 
@@ -126,7 +161,7 @@ def test_activation_daily_completion_and_restore_do_not_touch_user_todos(qapp, m
     assert state.history == []
 
     shown = []
-    service.note_dialog.show_note = lambda text, _anchor: shown.append(text)
+    service.note_dialog.show_note = lambda text, _anchor, _theme: shown.append(text)
     service.show_daily_note()
     first_index = state.settings.surpriseNoteIndex
     service.show_daily_note()
@@ -138,6 +173,9 @@ def test_activation_daily_completion_and_restore_do_not_touch_user_todos(qapp, m
     assert not service.active
     assert state.settings.windowMode == "normal"
     assert state.settings.surpriseKeyBlob == ""
+    # Deactivation restores the pre-activation skin and clears the marker.
+    assert state.settings.skin == "acrylic"
+    assert state.settings.preSurpriseSkin == ""
     assert [(todo.id, todo.done) for todo in state.todos] == [("regular", False)]
 
     service.note_dialog.close()
@@ -149,6 +187,7 @@ def test_activation_daily_completion_and_restore_do_not_touch_user_todos(qapp, m
 def test_surprise_row_stays_inside_compact_memo_width(qapp):
     service = SimpleNamespace(
         payload=_payload(),
+        app=SimpleNamespace(state=SimpleNamespace(settings=SimpleNamespace(surpriseNoteTheme="qinghua"))),
         completed_today=lambda: True,
         note_drawn_today=lambda: False,
         show_daily_note=lambda: None,
@@ -183,7 +222,7 @@ def test_surprise_dialogs_use_single_painted_surface_and_dynamic_note_height(qap
     assert activation.panel.styleSheet() == ""
     note.show_note("A remembered moment, written slowly enough to keep.")
     qapp.processEvents()
-    assert note.height() >= 420
+    assert note.height() >= 520
     assert note.panel.styleSheet() == ""
 
     activation.close()

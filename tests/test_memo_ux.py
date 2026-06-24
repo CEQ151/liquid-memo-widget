@@ -20,13 +20,6 @@ def test_near_highlight_days_roundtrips_and_clamps(saved, expected):
     assert restored.settings.nearHighlightDays == expected
 
 
-def test_manual_height_roundtrips():
-    payload = asdict(AppState())
-    payload["window"]["manualHeight"] = 543
-
-    assert AppState.from_dict(payload).window.manualHeight == 543
-
-
 def test_todo_sort_key_pins_urgent_then_uses_manual_order(qapp):
     from app import MemoWindow
 

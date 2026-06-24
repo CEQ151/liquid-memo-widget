@@ -204,6 +204,12 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         )
         self._nav_base_style = self.nav.styleSheet()
         self.window_mode.currentIndexChanged.connect(self._apply)
+        self.allow_screenshot = self._switch_row(
+            "允许被截屏",
+            "默认隐藏：截图和录屏不会拍到备忘窗口。开启后窗口可被截图 / 录屏捕获。",
+            self.app.state.settings.allowScreenshot,
+        )
+        self.allow_screenshot.checkedChanged.connect(lambda _checked: self._apply())
 
         self._section("提醒")
         self.notify_enabled = self._switch_row(
@@ -550,12 +556,27 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         layout.addWidget(restore)
         self.surprise_row = FluentSettingRow("特别模式", "清除本机保存的专属密钥并恢复原主题。", control)
         self.form.addWidget(self.surprise_row)
+        # Inline (not _combo_row) so we keep a handle on the row and can hide it outside 彩蛋模式.
+        self.note_theme_combo = ComboBox()
+        self.note_theme_combo.setFixedWidth(360)
+        enlarge_control_font(self.note_theme_combo)
+        for text, data in {"青花笺 · 蓝": "qinghua", "暖玉情书 · 暖": "warm", "黛粉笺 · 粉": "blush"}.items():
+            self.note_theme_combo.addItem(text, userData=data)
+        self.note_theme_combo.setCurrentIndex(
+            max(0, self.note_theme_combo.findData(self.app.state.settings.surpriseNoteTheme))
+        )
+        self.note_theme_combo.currentIndexChanged.connect(self._apply)
+        self.note_theme_row = FluentSettingRow("纸条主题", "拾光纸条的配色与气质。", self.note_theme_combo)
+        self.form.addWidget(self.note_theme_row)
         self.sync_surprise_state()
 
     def sync_surprise_state(self) -> None:
         if hasattr(self, "surprise_row"):
             surprise = getattr(self.app, "surprise", None)
-            self.surprise_row.setVisible(bool(surprise and surprise.active))
+            visible = bool(surprise and surprise.active)
+            self.surprise_row.setVisible(visible)
+            if hasattr(self, "note_theme_row"):
+                self.note_theme_row.setVisible(visible)
 
     def eventFilter(self, watched, event) -> bool:
         if watched is getattr(self, "update_status_label", None) and event.type() == QEvent.MouseButtonPress:
@@ -640,12 +661,16 @@ class SettingsWindow(FramelessDragMixin, QDialog):
     # ── Image skins (custom background pictures) ──────────────────────────────────────────
     def _refresh_skin_combo(self) -> None:
         """Rebuild the skin picker: the built-in frost skin plus one entry per saved image skin.
-        The built-in is always present and never removable; image skins reflect customSkins. Run
-        with signals blocked so rebuilding never fires _apply."""
+        The built-in is always present and never removable; image skins reflect customSkins. The
+        encrypted-only 灵动水墨 (swirl) entry appears *only* while surprise mode is active, so it
+        never shows to a normal user. Run with signals blocked so rebuilding never fires _apply."""
         combo = self.skin
         blocked = combo.blockSignals(True)
         combo.clear()
         combo.addItem("磨砂玻璃（推荐）", userData="acrylic")
+        surprise = getattr(self.app, "surprise", None)
+        if surprise is not None and surprise.active:
+            combo.addItem("灵动水墨", userData="surprise_swirl")
         for skin in self.app.state.settings.customSkins:
             combo.addItem(skin.name or "未命名图片", userData=f"image:{skin.id}")
         index = combo.findData(self.app.state.settings.skin)
@@ -796,6 +821,8 @@ class SettingsWindow(FramelessDragMixin, QDialog):
             self.calendar_enabled.blockSignals(True),
             self.calendar_days.blockSignals(True),
             self.auto_update.blockSignals(True),
+            self.note_theme_combo.blockSignals(True),
+            self.allow_screenshot.blockSignals(True),
         ]
         self._refresh_skin_combo()  # rebuild entries (custom skins may have changed) + reselect
         self._set_color_control(self.window_color, settings.windowTint)
@@ -813,6 +840,8 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         self.calendar_enabled.setChecked(settings.calendarEnabled)
         self.calendar_days.setValue(settings.calendarSyncDays)
         self.auto_update.setChecked(settings.autoCheckUpdates)
+        self.note_theme_combo.setCurrentIndex(max(0, self.note_theme_combo.findData(settings.surpriseNoteTheme)))
+        self.allow_screenshot.setChecked(settings.allowScreenshot)
         self.refresh_feed_list()
         self.refresh_image_skin_list()
         self.refresh_calendar_status()
@@ -820,7 +849,8 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         for widget, blocked in zip(
             [self.skin, self.font_mode, self.complete, self.position, self.startup,
              self.window_mode, self.notify_enabled, self.notify_minutes, self.near_highlight_days,
-             self.calendar_enabled, self.calendar_days, self.auto_update],
+             self.calendar_enabled, self.calendar_days, self.auto_update, self.note_theme_combo,
+             self.allow_screenshot],
             blockers,
         ):
             widget.blockSignals(blocked)
@@ -859,15 +889,20 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         settings.fontColorMode = str(self.font_mode.currentData())
         settings.completeBehavior = str(self.complete.currentData())
         settings.layerMode = "alwaysVisibleClickThrough"
-        # Surprise mode forces (and owns) the floatingLauncher window mode. The combo isn't synced
-        # at activation, so writing its stale value here would silently revert the forced mode.
-        surprise = getattr(self.app, "surprise", None)
-        if not (surprise is not None and surprise.active):
-            settings.windowMode = str(self.window_mode.currentData())
+        # Surprise mode auto-switches to floatingLauncher on activation (and syncs this combo via
+        # sync_from_state), but the user may freely change the window mode afterwards — same model as
+        # the skin picker — so write the combo value unconditionally.
+        settings.windowMode = str(self.window_mode.currentData())
         settings.notificationsEnabled = self.notify_enabled.isChecked()
+        screenshot_before = settings.allowScreenshot
+        settings.allowScreenshot = self.allow_screenshot.isChecked()
+        screenshot_changed = screenshot_before != settings.allowScreenshot
         settings.notifyMinutesBefore = int(self.notify_minutes.value())
         settings.nearHighlightDays = int(self.near_highlight_days.value())
         settings.autoCheckUpdates = self.auto_update.isChecked()
+        note_theme_before = settings.surpriseNoteTheme
+        settings.surpriseNoteTheme = str(self.note_theme_combo.currentData())
+        note_theme_changed = note_theme_before != settings.surpriseNoteTheme
         self.app.state.window.startPosition = str(self.position.currentData())
         if self.app.state.window.startPosition == "current":
             self.app.state.window.x = self.app.window.x()
@@ -890,6 +925,12 @@ class SettingsWindow(FramelessDragMixin, QDialog):
         else:
             self.app.save_later()
         self.app.window.apply_settings()
+        # A pure note-theme change doesn't alter the skin, so apply_settings won't relayout; rebuild
+        # the in-memo 拾光 row directly so its colours follow the new theme immediately.
+        if note_theme_changed:
+            self.app.window.refresh()
+        if screenshot_changed:
+            self.app.apply_capture_policy()
         if window_mode_before != settings.windowMode:
             controller = getattr(self.app, "floating", None)
             if controller is not None:
