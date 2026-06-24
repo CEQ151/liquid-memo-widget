@@ -41,6 +41,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
+[InstallDelete]
+; Wipe the previous PyInstaller payload before copying the new one. The installer only
+; overwrites same-named files, so without this an upgrade leaves orphaned DLLs from the old
+; build (e.g. plugins/helpers from a different bundled PySide6 version, since PySide6 is
+; unpinned) mixed in with the new ones - a mismatched Qt/GL DLL can break composition (black
+; QOpenGLWidget) without crashing. _internal is entirely installer-owned and regenerated on
+; every install; user data lives in %APPDATA%, so this is safe. Runs before [Files].
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 Source: "..\dist\LiquidMemoWidget\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
